@@ -144,7 +144,7 @@ class OwnerAuthService:
             path="/",
             secure=self.secure_cookie,
             httponly=True,
-            samesite="lax",
+            samesite="none" if self.secure_cookie else "lax",
         )
 
     def clear_session_cookie(self, response) -> None:
@@ -153,7 +153,7 @@ class OwnerAuthService:
             path="/",
             secure=self.secure_cookie,
             httponly=True,
-            samesite="lax",
+            samesite="none" if self.secure_cookie else "lax",
         )
 
     @staticmethod
