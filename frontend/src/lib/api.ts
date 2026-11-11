@@ -3,7 +3,57 @@ import axios from 'axios'
 // Base URL comes from VITE_API_BASE_URL (see .env.example at the repo root).
 export const api = axios.create({
   baseURL: import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:8000',
+  withCredentials: true,
 })
+
+export interface OwnerSession {
+  authenticated: boolean
+  csrf_token: string | null
+}
+
+// This token exists only in application memory and is refreshed from the
+// HttpOnly session endpoint after each page load.
+let csrfToken: string | null = null
+
+api.interceptors.request.use((config) => {
+  const method = (config.method ?? 'get').toLowerCase()
+  if (csrfToken && !['get', 'head', 'options'].includes(method)) {
+    config.headers.set('X-CSRF-Token', csrfToken)
+  }
+  return config
+})
+
+api.interceptors.response.use(
+  (response) => response,
+  (error: unknown) => {
+    if (
+      axios.isAxiosError(error) &&
+      error.response?.status === 401 &&
+      !String(error.config?.url ?? '').startsWith('/api/v1/auth/') &&
+      typeof window !== 'undefined'
+    ) {
+      window.dispatchEvent(new Event('growthloop:auth-expired'))
+    }
+    return Promise.reject(error)
+  },
+)
+
+export async function getOwnerSession(): Promise<OwnerSession> {
+  const response = await api.get<OwnerSession>('/api/v1/auth/session')
+  csrfToken = response.data.authenticated ? response.data.csrf_token : null
+  return response.data
+}
+
+export async function loginOwner(password: string): Promise<OwnerSession> {
+  const response = await api.post<OwnerSession>('/api/v1/auth/login', { password })
+  csrfToken = response.data.csrf_token
+  return response.data
+}
+
+export async function logoutOwner(): Promise<void> {
+  await api.post('/api/v1/auth/logout')
+  csrfToken = null
+}
 
 /** Experiment lifecycle states, mirroring the backend ExperimentStatus enum. */
 export const EXPERIMENT_STATUSES = [

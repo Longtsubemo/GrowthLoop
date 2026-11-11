@@ -1,0 +1,67 @@
+# GrowthLoop free-tier deployment blueprint.
+# Secrets and service-specific values are entered in the Render Dashboard.
+services:
+  - type: web
+    name: growthloop-api
+    runtime: python
+    plan: free
+    branch: dev
+    rootDir: backend
+    buildCommand: pip install .
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT --workers 1
+    healthCheckPath: /health/ready
+    autoDeployTrigger: "off"
+    envVars:
+      - key: APP_ENV
+        value: production
+      - key: DEBUG
+        value: "false"
+      - key: PYTHON_VERSION
+        value: 3.12.12
+      - key: DATABASE_URL
+        sync: false
+      - key: OWNER_PASSWORD
+        sync: false
+      - key: OWNER_SESSION_TTL_SECONDS
+        value: "28800"
+      - key: MCP_ISSUER_URL
+        fromService:
+          type: web
+          name: growthloop-api
+          envVarKey: RENDER_EXTERNAL_URL
+      - key: MCP_ALLOWED_HOSTS
+        fromService:
+          type: web
+          name: growthloop-api
+          envVarKey: RENDER_EXTERNAL_HOSTNAME
+      - key: CORS_ORIGINS
+        sync: false
+      - key: MCP_ALLOWED_ORIGINS
+        value: ""
+      - key: DB_POOL_SIZE
+        value: "1"
+      - key: DB_MAX_OVERFLOW
+        value: "0"
+      - key: DB_POOL_TIMEOUT_SECONDS
+        value: "5"
+      - key: DB_POOL_RECYCLE_SECONDS
+        value: "300"
+      - key: DB_CONNECT_TIMEOUT_SECONDS
+        value: "10"
+
+  - type: web
+    name: growthloop-dashboard
+    runtime: static
+    branch: dev
+    rootDir: frontend
+    buildCommand: npm ci && npm run build
+    staticPublishPath: dist
+    autoDeployTrigger: "off"
+    envVars:
+      - key: NODE_VERSION
+        value: 24.22.2
+      - key: VITE_API_BASE_URL
+        fromService:
+          type: web
+          name: growthloop-api
+          envVarKey: RENDER_EXTERNAL_URL

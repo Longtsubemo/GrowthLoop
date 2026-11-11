@@ -33,6 +33,9 @@ py -3.12 -m venv .venv            # once
 .venv\Scripts\Activate.ps1
 pip install -e ".[dev]"           # after dependency changes
 
+# Set OWNER_PASSWORD in the root .env before using the dashboard/API.
+# Set a unique secret of at least 16 characters; there is no default password.
+
 uvicorn app.main:app --reload     # http://localhost:8000 — GET /health
 pytest                            # all tests (DB tests need Postgres up)
 pytest tests/test_health.py       # single file
@@ -82,7 +85,11 @@ dependency-free hash router (`src/lib/router.ts`):
 | `#/experiments/:id/edit` | Edit form |
 
 The backend allows the dev-server origin through `CORS_ORIGINS` (see
-`.env.example`).
+`.env.example`). Protected REST calls require an owner session and CSRF token;
+the dashboard signs in with `OWNER_PASSWORD`. Remote MCP OAuth and its
+`/mcp` endpoint are documented in [MCP.md](MCP.md).
+The un-deployed Render and Neon preparation is documented in
+[DEPLOYMENT.md](DEPLOYMENT.md).
 
 ### Browser tests (Playwright)
 
@@ -96,17 +103,21 @@ The suite is intentionally end-to-end, not mocked:
 1. `tests/global-setup.ts` runs `backend/scripts/reset_e2e_database.py`,
    which drops/recreates the `growthloop_e2e` database and applies Alembic
    migrations. The URL is derived from `DATABASE_URL` (or the `.env`
-   files) with only the database name replaced, so credentials stay in one
-   place.
+   files) with only the database name replaced. Both setup layers reject
+   non-loopback hosts and any database name other than `growthloop_e2e`, so
+   destructive test setup cannot connect to Neon or another remote database.
 2. Playwright starts the real FastAPI backend on port **8377** (using
    `backend/.venv`) and Vite on port **5174**, with
-   `VITE_API_BASE_URL=http://127.0.0.1:8377`.
+   `VITE_API_BASE_URL=http://localhost:8377` and a random test-only owner
+   password.
 3. Tests create their data through the REST API (`tests/helpers.ts`) and
    run serially (`workers: 1`) because they share that database.
 
-Requires PostgreSQL (`docker compose up -d`) and the backend virtualenv.
-Development data is never touched; the e2e database can be deleted at any
-time.
+Requires local PostgreSQL (`docker compose up -d`) and the backend virtualenv.
+If `DATABASE_URL` in the environment or `.env` points to a remote database,
+the suite stops before connecting; set the process `DATABASE_URL` to the
+local Compose URL for the test run. Development data is never touched; the
+e2e database can be deleted at any time.
 
 ## Verification checklist
 

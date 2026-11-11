@@ -1,4 +1,5 @@
 import { defineConfig } from '@playwright/test'
+import { randomBytes } from 'node:crypto'
 
 import {
   BACKEND_ORIGIN,
@@ -10,6 +11,10 @@ import {
   resolveBackendPython,
   resolveE2eDatabaseUrl,
 } from './tests/e2e-env'
+
+const e2eOwnerPassword =
+  process.env.GROWTHLOOP_E2E_OWNER_PASSWORD ?? randomBytes(32).toString('base64url')
+process.env.GROWTHLOOP_E2E_OWNER_PASSWORD = e2eOwnerPassword
 
 export default defineConfig({
   testDir: './tests',
@@ -41,6 +46,8 @@ export default defineConfig({
       env: {
         ...process.env,
         DATABASE_URL: resolveE2eDatabaseUrl(),
+        OWNER_PASSWORD: e2eOwnerPassword,
+        MCP_ISSUER_URL: BACKEND_ORIGIN,
         CORS_ORIGINS: `${FRONTEND_ORIGIN},http://127.0.0.1:${FRONTEND_PORT}`,
       },
     },

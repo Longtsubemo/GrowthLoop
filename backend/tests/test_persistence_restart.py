@@ -56,6 +56,17 @@ def _wait_for_health(origin: str, process: subprocess.Popen) -> None:
     raise AssertionError(f"uvicorn at {origin} did not become healthy in 30s")
 
 
+def _authenticate_http_client(client: httpx.Client) -> None:
+    """Login to one fresh backend process and retain its cookie and CSRF token."""
+    login = client.post(
+        "/api/v1/auth/login",
+        json={"password": os.environ["OWNER_PASSWORD"]},
+        headers={"Origin": "http://localhost:5173"},
+    )
+    assert login.status_code == 200, login.text
+    client.headers["X-CSRF-Token"] = login.json()["csrf_token"]
+
+
 @contextmanager
 def running_backend(database_url: str) -> Iterator[str]:
     """Start uvicorn against ``database_url``; yield its origin; stop it."""
@@ -137,36 +148,34 @@ def test_record_survives_backend_restart_and_mcp_reconnect(
     try:
         # First process: create the record, then shut the process down.
         with running_backend(database_url) as origin:
-            response = httpx.post(
-                f"{origin}{EXPERIMENTS_URL}", json=payload, timeout=10
-            )
-            assert response.status_code == 201, response.text
-            created = response.json()
+            with httpx.Client(base_url=origin, timeout=10) as client:
+                _authenticate_http_client(client)
+                response = client.post(EXPERIMENTS_URL, json=payload)
+                assert response.status_code == 201, response.text
+                created = response.json()
 
         # Second process: the same record must still be there.
         with running_backend(database_url) as origin:
-            fetched = httpx.get(
-                f"{origin}{EXPERIMENTS_URL}/{created['id']}", timeout=10
-            )
-            assert fetched.status_code == 200, fetched.text
-            body = fetched.json()
-            assert body["id"] == created["id"]
-            assert body["title"] == payload["title"]
-            assert body["budget_amount"] == "4321.99"
-            assert body["execution_steps"] == ["Create", "Restart", "Verify"]
-            assert body["created_at"] == created["created_at"]
+            with httpx.Client(base_url=origin, timeout=10) as client:
+                _authenticate_http_client(client)
+                fetched = client.get(f"{EXPERIMENTS_URL}/{created['id']}")
+                assert fetched.status_code == 200, fetched.text
+                body = fetched.json()
+                assert body["id"] == created["id"]
+                assert body["title"] == payload["title"]
+                assert body["budget_amount"] == "4321.99"
+                assert body["execution_steps"] == ["Create", "Restart", "Verify"]
+                assert body["created_at"] == created["created_at"]
 
-            # A brand-new MCP stdio process reads and deletes the same row.
-            asyncio.run(
-                _mcp_get_and_delete(
-                    database_url, created["id"], payload["title"]
+                # A brand-new MCP stdio process reads and deletes the same row.
+                asyncio.run(
+                    _mcp_get_and_delete(
+                        database_url, created["id"], payload["title"]
+                    )
                 )
-            )
 
-            gone = httpx.get(
-                f"{origin}{EXPERIMENTS_URL}/{created['id']}", timeout=10
-            )
-            assert gone.status_code == 404
+                gone = client.get(f"{EXPERIMENTS_URL}/{created['id']}")
+                assert gone.status_code == 404
     finally:
         with migrated_engine.begin() as connection:
             connection.execute(sa.delete(Experiment))

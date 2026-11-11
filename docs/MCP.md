@@ -153,3 +153,128 @@ stdio server; Ctrl+C to stop):
 cd backend
 .venv\Scripts\python.exe -m mcp_server.server
 ```
+
+## Streamable HTTP endpoint
+
+Render and Neon production preparation, including exact hostname/origin
+configuration and the current one-worker/free-tier limitations, is in
+[DEPLOYMENT.md](DEPLOYMENT.md).
+
+The same FastAPI process also serves the seven tools over MCP Streamable
+HTTP at `/mcp`. It uses the MCP SDK 2.3 stateless HTTP transport because the
+experiment tools do not keep per-client protocol state. REST and MCP share
+the same seven tool registrations, service layer, and database session
+factory. The FastAPI lifespan starts and stops the SDK session manager.
+
+The HTTP resource requires OAuth access tokens, uses authorization code with
+PKCE and dynamic client registration, and presents an owner approval page.
+The owner signs in with `OWNER_PASSWORD`; access tokens are short lived and
+refresh tokens rotate. Dashboard REST requests instead use an HttpOnly owner
+session cookie and synchronizer CSRF token. Local stdio is unchanged and is
+intended for trusted local MCP clients.
+
+OAuth requires the canonical MCP resource URL in authorization and token
+requests. The server rejects missing or mismatched token-request resources,
+issues access and refresh tokens only for `/mcp`, and the SDK rejects tokens
+whose resource does not match that endpoint. Authorization responses include
+`iss`; OAuth metadata advertises that parameter. The installed MCP SDK client
+validates a present `iss` against the discovered issuer and rejects a missing
+value when the server advertises support.
+
+Dynamic registration accepts HTTPS callbacks and HTTP callbacks only for
+`localhost` or an IP loopback address. It rejects fragments, user information,
+missing hosts, other schemes, and any registration containing an invalid
+callback. Registration is limited to ten requests per observed client address
+per hour, the process retains at most 512 clients, and inactive registrations
+expire after 30 days. Pending authorizations, codes, and token pairs also have
+fixed process-local capacity limits. These are single-process abuse controls;
+they do not provide a distributed rate limit.
+
+Authentication is implemented locally, but **remote MCP has not been
+deployed or verified against a live public Claude connector**. Do not treat
+this repository as a publicly hosted service. Remote use requires HTTPS and
+the exact host and origin configuration below. Authentication protects the
+HTTP resource; Host and Origin allowlists are additional transport checks.
+
+### Local HTTP testing
+
+From `backend/`, start the hosted app after PostgreSQL is running and the
+schema is current:
+
+```powershell
+.venv\Scripts\python.exe -m alembic upgrade head
+.venv\Scripts\python.exe -m uvicorn app.main:app --reload
+```
+
+Before starting the app, configure `OWNER_PASSWORD` in the root `.env` to a
+unique value of at least 16 characters. No default password is provided.
+The local endpoint is `http://localhost:8000/mcp`; the OAuth issuer is
+`http://localhost:8000`. Development defaults allow local API hostnames and
+the dashboard origins on port 5173. The dashboard login is at
+`http://localhost:5173`.
+For automated protocol, tool, shared-record, error, and security checks,
+run from `backend/`:
+
+```powershell
+.venv\Scripts\python.exe -m pytest tests/test_mcp_http.py
+```
+
+The HTTP tests use an isolated test database managed by the backend test
+fixtures; they do not use the development database for destructive checks.
+
+### Connecting a remote MCP client
+
+Configure the client with the public MCP resource URL, for example
+`https://api.example.com/mcp`. A compatible OAuth client discovers the
+authorization server metadata, registers with the OAuth server when needed,
+and redirects the owner through GrowthLoop's sign-in and consent screen.
+The OAuth issuer URL is the API base URL, such as
+`https://api.example.com`; do not include `/mcp` in `MCP_ISSUER_URL`.
+
+Claude's [remote connector guide](https://support.anthropic.com/en/articles/11503834-building-custom-connectors-via-remote-mcp)
+describes OAuth for servers that require authentication, including dynamic
+client registration. This implementation follows that flow; it does not
+require a fixed custom bearer header in connector settings. Availability of
+custom connectors depends on the Claude plan and account. See also Anthropic's
+[connector setup guide](https://support.anthropic.com/en/articles/11175166-about-custom-integrations-using-remote-mcp).
+
+### Remote host configuration expectations
+
+The host must run the FastAPI application and provide a hosted PostgreSQL
+`DATABASE_URL`. Configure `APP_ENV=production`, `DEBUG=false`, a strong unique
+`OWNER_PASSWORD`, `MCP_ISSUER_URL` as the exact public API base URL, the
+dashboard's exact HTTPS `CORS_ORIGINS`, and `MCP_ALLOWED_HOSTS` with the exact
+public API hostname (for example, `api.example.com`, without a wildcard).
+Set `MCP_ALLOWED_ORIGINS` to exact HTTPS origins only if the MCP client sends
+an `Origin` header; an explicitly empty value rejects all supplied origins
+while allowing clients that omit the header. Those exact origins are also
+included in the app's CORS policy for browser-based clients. The host must
+provide HTTPS.
+
+Owner sessions, OAuth client registrations, authorization requests, and
+tokens are currently held in process memory. An API restart invalidates them;
+run one application worker only. Multi-worker or horizontally scaled hosting
+needs a shared persistent session/token store. No such host configuration or
+public deployment is included in this phase.
+
+The exact Host and Origin allowlists help block arbitrary Host headers and
+DNS-rebinding-style browser requests. They do not authenticate a user; OAuth
+authorization is handled separately. Keep the local stdio process restricted
+to trusted MCP clients.
+
+The MCP SDK validates the request Host and, when present, Origin on the
+Streamable HTTP transport using `MCP_ALLOWED_HOSTS` and
+`MCP_ALLOWED_ORIGINS`. FastAPI's `TrustedHostMiddleware` independently checks
+Host on all API routes. Browser CORS uses exact origins: `CORS_ORIGINS` is for
+the dashboard, and `MCP_ALLOWED_ORIGINS` is for browser-based MCP/OAuth
+clients. The SDK 2.3 OAuth helpers emit wildcard CORS headers internally;
+the hosted app removes those headers and lets FastAPI add CORS headers only
+for configured origins. No wildcard is enabled by the application.
+
+After Render assigns the dashboard hostname, set `CORS_ORIGINS` to that
+exact HTTPS origin. Keep `MCP_ALLOWED_ORIGINS` empty unless the intended MCP
+client sends an Origin header. Claude's remote connector Origin behavior has
+not been verified against a live connection, so do not guess or preconfigure
+an origin for it. If an Origin header is observed, add only that exact HTTPS
+origin in the backend environment and retest. Requests without Origin remain
+allowed by the MCP transport; requests with an unlisted Origin are rejected.

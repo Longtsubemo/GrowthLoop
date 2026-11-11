@@ -25,6 +25,26 @@ def test_preflight_from_allowed_origin_is_accepted() -> None:
     assert "GET" in response.headers["access-control-allow-methods"]
 
 
+def test_mcp_preflight_allows_streamable_http_headers() -> None:
+    client = TestClient(app)
+    response = client.options(
+        "/mcp",
+        headers={
+            "Origin": "http://localhost:5173",
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "content-type,mcp-protocol-version",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == (
+        "http://localhost:5173"
+    )
+    assert "POST" in response.headers["access-control-allow-methods"]
+    allowed_headers = response.headers["access-control-allow-headers"].lower()
+    assert "mcp-protocol-version" in allowed_headers
+
+
 def test_response_includes_allow_origin_for_allowed_origin() -> None:
     client = TestClient(app)
     response = client.get("/health", headers={"Origin": "http://localhost:5173"})

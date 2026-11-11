@@ -11,9 +11,10 @@ import { backendDir, resolveBackendPython, resolveE2eDatabaseUrl } from './e2e-e
 export default async function globalSetup(): Promise<void> {
   const python = resolveBackendPython()
   const databaseUrl = resolveE2eDatabaseUrl()
-  const result = spawnSync(python, ['scripts/reset_e2e_database.py', databaseUrl], {
+  const result = spawnSync(python, ['scripts/reset_e2e_database.py'], {
     cwd: backendDir,
-    stdio: 'inherit',
+    stdio: ['pipe', 'inherit', 'inherit'],
+    input: databaseUrl,
   })
   if (result.error) {
     throw result.error

@@ -46,10 +46,37 @@ export interface ExperimentInput {
 }
 
 const API_URL = `${BACKEND_ORIGIN}/api/v1/experiments`
+let ownerCredentials: { cookie: string; csrfToken: string } | null = null
+
+async function authenticateOwner(): Promise<{ cookie: string; csrfToken: string }> {
+  if (ownerCredentials) return ownerCredentials
+  const password = process.env.GROWTHLOOP_E2E_OWNER_PASSWORD
+  if (!password) throw new Error('Playwright owner password was not initialized')
+  const response = await fetch(`${BACKEND_ORIGIN}/api/v1/auth/login`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      origin: 'http://localhost:5174',
+    },
+    body: JSON.stringify({ password }),
+  })
+  if (!response.ok) throw new Error(`Owner login failed (${response.status})`)
+  const cookie = response.headers.get('set-cookie')?.split(';', 1)[0]
+  const session = (await response.json()) as { csrf_token: string }
+  if (!cookie || !session.csrf_token) throw new Error('Owner session was not returned')
+  ownerCredentials = { cookie, csrfToken: session.csrf_token }
+  return ownerCredentials
+}
 
 async function request(path: string, init?: RequestInit): Promise<Response> {
+  const credentials = await authenticateOwner()
   const response = await fetch(`${API_URL}${path}`, {
-    headers: { 'content-type': 'application/json' },
+    headers: {
+      'content-type': 'application/json',
+      origin: 'http://localhost:5174',
+      cookie: credentials.cookie,
+      'x-csrf-token': credentials.csrfToken,
+    },
     ...init,
   })
   if (!response.ok) {

@@ -5,17 +5,17 @@ against an isolated PostgreSQL database so they never touch development
 data — the same strategy as ``backend/tests/conftest.py``. This script
 drops and recreates that database and applies all migrations.
 
-It is invoked by ``frontend/tests/global-setup.ts`` as:
+It is invoked by ``frontend/tests/global-setup.ts``. The URL is sent over
+standard input so credentials never appear in the process command line.
 
-    python scripts/reset_e2e_database.py <e2e-database-url>
-
-The URL is passed in by the TypeScript side (which derives it from
-``DATABASE_URL`` in the environment or ``.env`` files), so both sides use
-a single source of truth for where the e2e database lives.
+The TypeScript side derives it from ``DATABASE_URL`` in the environment or
+``.env`` files. Both sides enforce that only a local PostgreSQL server and
+the dedicated ``growthloop_e2e`` database can be reset.
 
 Exits non-zero with a clear message when PostgreSQL is not reachable.
 """
 
+import ipaddress
 import sys
 from pathlib import Path
 
@@ -32,10 +32,25 @@ from sqlalchemy.engine import make_url  # noqa: E402
 
 
 def main() -> int:
-    if len(sys.argv) != 2:
-        print("usage: reset_e2e_database.py <e2e-database-url>", file=sys.stderr)
+    if len(sys.argv) != 1:
+        print("This script accepts its database URL only through standard input.", file=sys.stderr)
         return 2
-    e2e_url = make_url(sys.argv[1])
+    try:
+        e2e_url = make_url(sys.stdin.read().strip())
+    except Exception:
+        print("Invalid e2e database URL.", file=sys.stderr)
+        return 2
+    hostname = (e2e_url.host or "").lower()
+    try:
+        is_loopback = hostname == "localhost" or ipaddress.ip_address(hostname).is_loopback
+    except ValueError:
+        is_loopback = False
+    if not is_loopback or e2e_url.database != "growthloop_e2e":
+        print(
+            "Refusing to reset a database unless it is the local growthloop_e2e database.",
+            file=sys.stderr,
+        )
+        return 2
     server_url = e2e_url.set(database="postgres")
 
     engine = create_engine(server_url)
@@ -67,7 +82,7 @@ def main() -> int:
     )
     command.upgrade(config, "head")
 
-    print(f"e2e database ready: {database} on {server_url.render_as_string(hide_password=True)}")
+    print(f"e2e database ready: {database} on local PostgreSQL")
     return 0
 
 

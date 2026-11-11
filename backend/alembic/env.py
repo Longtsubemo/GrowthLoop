@@ -16,15 +16,17 @@ from sqlalchemy import create_engine, pool
 import app.models  # noqa: F401 — registers models on Base.metadata
 from app.core.config import get_settings
 from app.db.base import Base
+from app.db.url import normalize_database_url
 
 config = context.config
 
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-database_url = (
+raw_database_url = (
     config.get_main_option("sqlalchemy.url") or get_settings().database_url
 )
+database_url = normalize_database_url(raw_database_url)
 
 target_metadata = Base.metadata
 
@@ -32,7 +34,8 @@ target_metadata = Base.metadata
 def run_migrations_offline() -> None:
     """Emit SQL to stdout instead of against a live connection."""
     context.configure(
-        url=database_url,
+        # Offline SQL generation needs the dialect URL but no credentials.
+        url=database_url.render_as_string(hide_password=True),
         target_metadata=target_metadata,
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
@@ -45,7 +48,13 @@ def run_migrations_offline() -> None:
 
 def run_migrations_online() -> None:
     """Run migrations against a live connection."""
-    connectable = create_engine(database_url, poolclass=pool.NullPool)
+    settings = get_settings()
+    connectable = create_engine(
+        database_url,
+        poolclass=pool.NullPool,
+        connect_args={"connect_timeout": settings.db_connect_timeout_seconds},
+        hide_parameters=True,
+    )
 
     with connectable.connect() as connection:
         context.configure(

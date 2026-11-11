@@ -18,6 +18,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from app.api.deps import get_db_session
 from app.main import app
+from app.core.config import get_settings
 from mcp_server import server as mcp_server_module
 
 pytestmark = pytest.mark.anyio
@@ -85,6 +86,12 @@ async def test_rest_reports_database_unavailable_without_leaking() -> None:
     app.dependency_overrides[get_db_session] = override_get_db_session
     try:
         with TestClient(app, raise_server_exceptions=False) as client:
+            login = client.post(
+                "/api/v1/auth/login",
+                json={"password": get_settings().owner_password},
+                headers={"Origin": "http://localhost:5173"},
+            )
+            assert login.status_code == 200
             response = client.get(EXPERIMENTS_URL)
     finally:
         app.dependency_overrides.clear()
@@ -130,7 +137,13 @@ async def test_concurrent_cross_interface_updates_remain_consistent(
 
     transport = ASGITransport(app=app)
     async with AsyncClient(
-        transport=transport, base_url="http://testserver"
+        transport=transport,
+        base_url="http://testserver",
+        cookies={"growthloop_session": rest.cookies.get("growthloop_session")},
+        headers={
+            "Origin": "http://localhost:5173",
+            "X-CSRF-Token": rest.headers["X-CSRF-Token"],
+        },
     ) as http:
         first, second, mcp_result = await asyncio.gather(
             http.patch(

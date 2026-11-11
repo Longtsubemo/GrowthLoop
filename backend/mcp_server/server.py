@@ -9,8 +9,9 @@ schemas are derived from the shared Pydantic aliases in
 through the shared ``SessionLocal`` factory (one short database
 session per tool invocation).
 
-The server speaks MCP over stdio (``mcp.run()``). stdout carries only
-protocol messages; diagnostics go to stderr via the SDK's logging.
+The local server speaks MCP over stdio (``mcp.run()``). The hosted FastAPI
+application creates a separate OAuth-protected HTTP server using the same
+tool handlers. stdout for the stdio process carries only protocol messages.
 
 Note: this uses the Python MCP SDK v2 API, where the v1 ``FastMCP`` was
 renamed to ``MCPServer`` (``from mcp.server.mcpserver import MCPServer``).
@@ -22,6 +23,7 @@ from contextlib import contextmanager
 from typing import Annotated, Any, TypeVar
 from uuid import UUID
 
+from mcp.server.auth.settings import AuthSettings
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
@@ -30,6 +32,7 @@ from pydantic.json_schema import PydanticJsonSchemaWarning
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
+from app.core.auth import OwnerAuthService
 from app.db.session import SessionLocal
 from app.models import Experiment
 from app.models.experiment import ExperimentStatus
@@ -46,6 +49,7 @@ from app.schemas.experiment import (
 )
 from app.services import experiment_service
 from app.services.exceptions import ExperimentNotFoundError
+from mcp_server.oauth import GrowthLoopOAuthProvider, register_consent_route
 
 ModelT = TypeVar("ModelT", bound=BaseModel)
 
@@ -55,17 +59,30 @@ ModelT = TypeVar("ModelT", bound=BaseModel)
 # omitted ``update_experiment`` fields therefore carry this marker.
 _UNSET: Any = object()
 
-mcp = MCPServer(
-    "growthloop",
-    version="0.1.0",
-    instructions=(
-        "Manage growth experiments: create them, list and fetch them, "
-        "update their fields and lifecycle status, record their actual "
-        "results, and delete them. Every change is persisted to "
-        "PostgreSQL immediately and is visible in the GrowthLoop "
-        "dashboard."
-    ),
-)
+
+def _new_server(
+    *,
+    auth_settings: AuthSettings | None = None,
+    oauth_provider: GrowthLoopOAuthProvider | None = None,
+) -> MCPServer:
+    """Create a server with the shared GrowthLoop identity and guidance."""
+    return MCPServer(
+        "growthloop",
+        version="0.1.0",
+        instructions=(
+            "Manage growth experiments: create them, list and fetch them, "
+            "update their fields and lifecycle status, record their actual "
+            "results, and delete them. Every change is persisted to "
+            "PostgreSQL immediately and is visible in the GrowthLoop "
+            "dashboard."
+        ),
+        auth=auth_settings,
+        auth_server_provider=oauth_provider,
+    )
+
+
+# The local Claude Desktop entry point retains a dedicated stdio server.
+mcp = _new_server()
 
 
 def _serialize(experiment: Experiment) -> dict[str, Any]:
@@ -261,8 +278,8 @@ def delete_experiment(experiment_id: UUID) -> dict[str, Any]:
     return {"deleted": True, "experiment_id": str(experiment_id)}
 
 
-def _register_tools() -> None:
-    """Register the seven experiment tools on the MCP server."""
+def _register_tools(server: MCPServer) -> None:
+    """Register the seven experiment tools on an MCP server instance."""
     with warnings.catch_warnings():
         # update_experiment marks omitted fields with a non-JSON sentinel
         # default. Pydantic warns that the sentinel cannot be rendered in
@@ -270,20 +287,44 @@ def _register_tools() -> None:
         # we want (optional field, no advertised default) — so the
         # warning is expected and suppressed here.
         warnings.simplefilter("ignore", PydanticJsonSchemaWarning)
-        mcp.add_tool(create_experiment)
-        mcp.add_tool(
+        server.add_tool(create_experiment)
+        server.add_tool(
             list_experiments, annotations=ToolAnnotations(readOnlyHint=True)
         )
-        mcp.add_tool(get_experiment, annotations=ToolAnnotations(readOnlyHint=True))
-        mcp.add_tool(update_experiment)
-        mcp.add_tool(update_experiment_status)
-        mcp.add_tool(record_experiment_result)
-        mcp.add_tool(
+        server.add_tool(get_experiment, annotations=ToolAnnotations(readOnlyHint=True))
+        server.add_tool(update_experiment)
+        server.add_tool(update_experiment_status)
+        server.add_tool(record_experiment_result)
+        server.add_tool(
             delete_experiment, annotations=ToolAnnotations(destructiveHint=True)
         )
 
 
-_register_tools()
+def create_mcp_server(
+    *,
+    oauth_provider: GrowthLoopOAuthProvider,
+    auth_settings: AuthSettings,
+    owner_auth: OwnerAuthService,
+    production: bool,
+    issuer_origin: str,
+) -> MCPServer:
+    """Build the authenticated HTTP server while keeping stdio auth-free."""
+    server = _new_server(
+        auth_settings=auth_settings,
+        oauth_provider=oauth_provider,
+    )
+    _register_tools(server)
+    register_consent_route(
+        server,
+        oauth_provider,
+        owner_auth,
+        production=production,
+        issuer_origin=issuer_origin,
+    )
+    return server
+
+
+_register_tools(mcp)
 
 
 def main() -> None:
