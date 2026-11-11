@@ -30,6 +30,38 @@ postgresql+psycopg://postgres:postgres@localhost:5432/growthloop
 
 `app/db/session.py` builds the engine and session factory from settings.
 
+## Hosted PostgreSQL
+
+For production, set `APP_ENV=production`, `DEBUG=false`, an explicit managed
+database URL, and the dashboard's exact HTTPS origin in `CORS_ORIGINS`. The
+application rejects missing production database/origin settings, localhost
+database hosts, and non-HTTPS or local browser origins. Store credentials in
+the hosting provider's secret environment settings; do not put real URLs in
+`.env.example` or source control.
+
+Managed providers often supply a `postgresql://` (or legacy `postgres://`)
+URL. Both the application engine and Alembic parse that value as a SQLAlchemy
+URL and select the psycopg 3 driver (`postgresql+psycopg`) while preserving
+encoded credentials and query parameters such as `sslmode=require`. A URL
+already using `postgresql+psycopg://` is kept as configured. Do not remove the
+provider's SSL options. `DB_POOL_SIZE`, `DB_MAX_OVERFLOW`, `DB_POOL_TIMEOUT_SECONDS`,
+`DB_POOL_RECYCLE_SECONDS`, and `DB_CONNECT_TIMEOUT_SECONDS` configure the
+small per-process pool; the defaults are 2 retained connections, no overflow,
+and bounded connection waits.
+
+For the prepared Render setup, Neon supplies the production URL. Copy the
+pooled connection string for the runtime application, retain Neon's SSL
+parameters, and use the direct owner connection only when running migrations
+manually. The Render configuration uses one process, a pool size of one, and
+zero overflow connections. The existing Neon setup uses the least-privilege
+`growthloop_app` role for runtime CRUD and keeps `neondb_owner` separate for
+migrations. See [DEPLOYMENT.md](DEPLOYMENT.md) for the two-role configuration
+and applying migrations without running them at every application startup.
+
+`GET /health` is a liveness check and does not depend on PostgreSQL.
+`GET /health/ready` runs `SELECT 1` and returns `503` with a generic message
+when PostgreSQL cannot be reached; it never returns connection details.
+
 ## Schema & migrations
 
 Alembic manages the schema (migrations live in `backend/alembic/versions/`;

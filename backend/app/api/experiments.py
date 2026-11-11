@@ -10,7 +10,7 @@ from fastapi import APIRouter, Depends, Query
 from fastapi import status as http_status
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_db_session
+from app.api.deps import get_db_session, require_csrf_token, require_owner_session
 from app.models import Experiment, ExperimentStatus
 from app.schemas.experiment import (
     ExperimentCreate,
@@ -22,13 +22,18 @@ from app.schemas.experiment import (
 )
 from app.services import experiment_service
 
-experiments_router = APIRouter(prefix="/api/v1/experiments", tags=["experiments"])
+experiments_router = APIRouter(
+    prefix="/api/v1/experiments",
+    tags=["experiments"],
+    dependencies=[Depends(require_owner_session)],
+)
 
 
 @experiments_router.post(
     "",
     response_model=ExperimentResponse,
     status_code=http_status.HTTP_201_CREATED,
+    dependencies=[Depends(require_csrf_token)],
 )
 def create_experiment(
     payload: ExperimentCreate, session: Session = Depends(get_db_session)
@@ -65,7 +70,11 @@ def get_experiment(
     return experiment_service.get_experiment(session, experiment_id)
 
 
-@experiments_router.patch("/{experiment_id}", response_model=ExperimentResponse)
+@experiments_router.patch(
+    "/{experiment_id}",
+    response_model=ExperimentResponse,
+    dependencies=[Depends(require_csrf_token)],
+)
 def update_experiment(
     experiment_id: uuid.UUID,
     payload: ExperimentUpdate,
@@ -76,7 +85,9 @@ def update_experiment(
 
 
 @experiments_router.patch(
-    "/{experiment_id}/status", response_model=ExperimentResponse
+    "/{experiment_id}/status",
+    response_model=ExperimentResponse,
+    dependencies=[Depends(require_csrf_token)],
 )
 def update_experiment_status(
     experiment_id: uuid.UUID,
@@ -90,7 +101,9 @@ def update_experiment_status(
 
 
 @experiments_router.patch(
-    "/{experiment_id}/result", response_model=ExperimentResponse
+    "/{experiment_id}/result",
+    response_model=ExperimentResponse,
+    dependencies=[Depends(require_csrf_token)],
 )
 def record_experiment_result(
     experiment_id: uuid.UUID,
@@ -104,7 +117,9 @@ def record_experiment_result(
 
 
 @experiments_router.delete(
-    "/{experiment_id}", status_code=http_status.HTTP_204_NO_CONTENT
+    "/{experiment_id}",
+    status_code=http_status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(require_csrf_token)],
 )
 def delete_experiment(
     experiment_id: uuid.UUID, session: Session = Depends(get_db_session)

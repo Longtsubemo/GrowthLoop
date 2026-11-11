@@ -7,6 +7,7 @@ interface AppLayoutProps {
   route: Route
   title: string
   actions?: ReactNode
+  onLogout: () => void
   children: ReactNode
 }
 
@@ -42,7 +43,7 @@ export function NewExperimentButton() {
  * Application shell: fixed sidebar navigation on desktop, a top header
  * (with brand and horizontal nav on mobile), and the main content area.
  */
-export function AppLayout({ route, title, actions, children }: AppLayoutProps) {
+export function AppLayout({ route, title, actions, onLogout, children }: AppLayoutProps) {
   return (
     <div className="min-h-screen bg-slate-50 text-slate-900">
       <aside className="fixed inset-y-0 left-0 z-40 hidden w-64 flex-col border-r border-slate-200 bg-white lg:flex">
@@ -74,8 +75,8 @@ export function AppLayout({ route, title, actions, children }: AppLayoutProps) {
         </nav>
         <div className="border-t border-slate-200 px-5 py-4">
           <p className="text-xs leading-5 text-slate-400">
-            Experiments can also be managed by Claude through the local MCP
-            server. Everything Claude changes is editable here.
+            Experiments can also be managed by Claude through a configured MCP
+            connection. Changes remain reviewable here.
           </p>
         </div>
       </aside>
@@ -92,7 +93,16 @@ export function AppLayout({ route, title, actions, children }: AppLayoutProps) {
             <h1 className="hidden text-lg font-semibold tracking-tight text-slate-900 lg:block">
               {title}
             </h1>
-            {actions && <div className="ml-auto flex items-center gap-2">{actions}</div>}
+            <div className="ml-auto flex items-center gap-2">
+              {actions}
+              <button
+                className="rounded-md px-2 py-1.5 text-sm font-medium text-slate-600 hover:bg-slate-100 hover:text-slate-900"
+                onClick={onLogout}
+                type="button"
+              >
+                Sign out
+              </button>
+            </div>
           </div>
           <nav
             className="flex gap-1 border-t border-slate-100 px-3 py-1.5 lg:hidden"

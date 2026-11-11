@@ -7,8 +7,8 @@ review, edit, and operate on the same records in a React dashboard.
 
 The application itself contains **no AI or LLM functionality**. It stores,
 validates, and presents experiment data. Claude is an external client that
-reaches the app only through the local MCP server, which calls the same
-business logic as the REST API.
+reaches the app through the local MCP server or the OAuth-protected remote
+MCP endpoint; both call the same business logic as the REST API.
 
 ## Features
 
@@ -30,32 +30,29 @@ business logic as the REST API.
   changes always stay in sync.
 - **Precision-safe budgets** — amounts are stored as PostgreSQL `NUMERIC(12,2)`
   and travel as decimal strings through both interfaces.
-- **Real end-to-end tests** — pytest against a throwaway PostgreSQL database
-  plus Playwright against the real FastAPI backend, real database, and real
-  MCP stdio process.
+- **Owner access control** — the dashboard and REST API use an HttpOnly
+  server-managed session with CSRF protection; remote MCP uses OAuth bearer
+  tokens. Local stdio remains available for Claude Desktop.
+- **Real end-to-end tests** — pytest against isolated PostgreSQL databases
+  plus Playwright against the real FastAPI backend and database.
 
 ## Architecture
 
 ```
-Claude Desktop
-      |  MCP over stdio
-      v
-Python MCP server  (backend/mcp_server/)
-      |
-      v
-Shared business logic  (backend/app/services/)
-      |
-      +--> FastAPI REST API  (backend/app/api/)  -->  React dashboard (frontend/)
-      |
-      v
-PostgreSQL  (SQLAlchemy: backend/app/db/, backend/app/models/)
+Claude Desktop -- MCP/stdio --> MCP server ----------------------+
+                                                                  |
+Claude connector -- OAuth/HTTP --> FastAPI MCP endpoint ---------+--> Shared services
+                                                                  |   (backend/app/services/)
+React dashboard -- session/CSRF --> FastAPI REST API -------------+          |
+                                                                             v
+                                                               PostgreSQL (SQLAlchemy)
 ```
 
 | Layer | Technology |
 | --- | --- |
 | Frontend | React 19, Vite 8, TypeScript, Tailwind CSS v4, axios |
 | Backend | Python 3.12, FastAPI, Pydantic v2, SQLAlchemy 2, psycopg 3 |
-| MCP server | Python MCP SDK v2 (`mcp.server.mcpserver.MCPServer`), stdio transport |
+| MCP server | Python MCP SDK v2 (`mcp.server.mcpserver.MCPServer`), stdio and Streamable HTTP |
 | Database | PostgreSQL 17 (Docker Compose locally), Alembic migrations |
 | Tests | pytest + httpx, Playwright (`@playwright/test`) |
 
@@ -158,6 +155,11 @@ The API runs at <http://localhost:8000>. Verify it with
 `GET http://localhost:8000/health` → `{"status":"ok"}`. Interactive API docs
 are at <http://localhost:8000/docs>.
 
+Set a unique `OWNER_PASSWORD` in the root `.env` before opening the dashboard;
+there is no default password. The same owner password approves remote MCP
+authorization. Keep it private and use at least 16 characters. `MCP_ISSUER_URL`
+defaults to `http://localhost:8000` for local development.
+
 If `Activate.ps1` is blocked by the execution policy, run
 `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`, or call
 `.venv\Scripts\python.exe` directly.
@@ -191,24 +193,55 @@ are documented in [`docs/MCP.md`](docs/MCP.md).
 
 ## Environment configuration
 
-All variables are optional locally; the defaults below match
-`docker-compose.yml` and the Vite dev server. Configuration is read from the
+Most variables are optional locally; the defaults below match
+`docker-compose.yml` and the Vite dev server. `OWNER_PASSWORD` must be set to
+use the dashboard or approve remote MCP access. Configuration is read from the
 process environment and then from `.env` in the working directory or the
 repository root (so one root `.env` works when the backend runs from
 `backend/`).
 
 | Variable | Default | Used by | Purpose |
 | --- | --- | --- | --- |
-| `DATABASE_URL` | `postgresql+psycopg://postgres:postgres@localhost:5432/growthloop` | Backend, Alembic, MCP | SQLAlchemy connection string (psycopg 3 driver) |
+| `APP_ENV` | `development` | Backend | `development` preserves local defaults; `production` requires explicit hosted database and browser-origin settings |
+| `DEBUG` | `false` | Backend | Debug mode is opt-in for local development; production rejects `true` |
+| `DATABASE_URL` | `postgresql+psycopg://postgres:postgres@localhost:5432/growthloop` | Backend, Alembic, MCP | PostgreSQL connection URL. Standard `postgresql://` and `postgres://` provider URLs are parsed and switched to psycopg 3 without dropping query parameters |
+| `OWNER_PASSWORD` | none | Backend | Required owner password for the dashboard, REST API session, and remote MCP consent; set a unique secret of 16–1024 characters |
+| `OWNER_SESSION_TTL_SECONDS` | `28800` | Backend | Owner session lifetime, from 5 minutes to 24 hours |
+| `MCP_ISSUER_URL` | `http://localhost:8000` | Backend, MCP | Exact API base URL used as the remote MCP OAuth issuer and resource origin |
 | `CORS_ORIGINS` | `http://localhost:5173,http://127.0.0.1:5173` | Backend | Comma-separated browser origins allowed to call the API |
+| `MCP_ALLOWED_HOSTS` | local API hostnames | Backend, MCP | Exact Host-header hostnames accepted by the app and MCP transport |
+| `MCP_ALLOWED_ORIGINS` | local dashboard origins | Backend, MCP | Exact browser origins accepted by MCP transport checks |
+| `DB_POOL_SIZE` | `2` | Backend | Number of SQLAlchemy connections retained per process |
+| `DB_MAX_OVERFLOW` | `0` | Backend | Temporary connections above the pool size |
+| `DB_POOL_TIMEOUT_SECONDS` | `5` | Backend | Maximum wait for a pooled connection |
+| `DB_POOL_RECYCLE_SECONDS` | `300` | Backend | Recycle interval for pooled connections |
+| `DB_CONNECT_TIMEOUT_SECONDS` | `10` | Backend | Maximum wait for a new PostgreSQL connection |
 | `POSTGRES_USER` | `postgres` | Docker Compose | PostgreSQL user |
 | `POSTGRES_PASSWORD` | `postgres` | Docker Compose | PostgreSQL password |
 | `POSTGRES_DB` | `growthloop` | Docker Compose | Database name |
 | `POSTGRES_PORT` | `5432` | Docker Compose | Host port for PostgreSQL |
 | `VITE_API_BASE_URL` | `http://localhost:8000` | Frontend | Base URL of the REST API |
 
-`.env.example` documents the same variables. Real credentials must never be
-committed.
+`.env.example` documents local defaults and commented production examples.
+For production, set `APP_ENV=production`, `DEBUG=false`, a strong unique
+`OWNER_PASSWORD`, hosted `DATABASE_URL`, exact public API `MCP_ISSUER_URL`,
+exact API hostname in `MCP_ALLOWED_HOSTS`, and the dashboard's exact HTTPS
+origin in `CORS_ORIGINS`. Use HTTPS and exact MCP origins when browser MCP
+clients need them. Production configuration rejects missing/local database
+URLs and local or non-HTTPS origins. Keep real credentials in the host's secret
+environment store; never commit them. Remote MCP authentication is implemented
+but has not been deployed or verified against a live public Claude connector.
+
+## Deployment preparation
+
+[`render.yaml`](render.yaml) describes a Render Free Web Service and Static
+Site on `dev`, with the frontend pointed at the backend and no automatic
+redeploys. [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) gives the manual Neon and
+Render steps, environment variables, migration procedure, smoke checks, and
+free-tier limits. The existing Neon `my-first-project` database is prepared
+for the app; no Render services have been created. Free hosting has cold
+starts, finite quotas, and limited backup/restore guarantees; this is demo
+preparation rather than production-grade hosting.
 
 ## Database and migrations
 
@@ -234,6 +267,7 @@ Base URL: `http://localhost:8000`. All endpoints are under `/api/v1`.
 | Method | Path | Description | Success |
 | --- | --- | --- | --- |
 | `GET` | `/health` | Liveness check | `200` |
+| `GET` | `/health/ready` | Readiness check; runs `SELECT 1` against PostgreSQL | `200` or `503` |
 | `POST` | `/api/v1/experiments` | Create an experiment | `201` |
 | `GET` | `/api/v1/experiments` | List experiments, newest first. Query: `status`, `limit` (1–100, default 20), `offset` (default 0) | `200` |
 | `GET` | `/api/v1/experiments/{experiment_id}` | Fetch one experiment by UUID | `200` |
@@ -318,31 +352,29 @@ database, starts FastAPI on port `8377`, and Vite on port `5174`. It runs
 serially (`workers: 1`) because the specs share that database. Development
 data is never touched.
 
-### Current verified results (Phase 5A)
-
-Verified on 2026-11-11:
-
-| Check | Result |
-| --- | --- |
-| `pytest` (full backend suite) | **155 passed** |
-| `npm run test:e2e` (full Playwright suite) | **25 passed** |
-| `npm run build` | passed |
-| `npm run lint` | passed |
-
 ## Current limitations
 
-- **No authentication or multi-tenancy.** The API is unauthenticated and all
-  records belong to one implicit workspace. Do not expose it publicly.
+- **Single owner, no multi-tenancy.** All records belong to one implicit
+  workspace. The dashboard and REST API use one configured owner password;
+  the remote MCP OAuth flow grants that same owner's access.
+- **Authentication state is in process memory.** Restarting the API invalidates
+  sessions, OAuth clients, and tokens. Run a single application worker; multiple
+  workers do not share authentication state. A persistent shared store is needed
+  before horizontally scaled production use.
 - **Duplicate creates are not idempotent.** Two identical `create_experiment`
   calls produce two separate records by design. Retries must be handled by
   the client.
 - **Concurrent updates are last-write-wins.** There is no optimistic locking;
   simultaneous edits settle on the last committed write without conflict
   detection.
-- **MCP runs locally over stdio only.** The SDK supports streamable HTTP, but
-  no hosted/remote MCP endpoint is implemented.
-- **Deployment is not set up.** Vercel/Render are planned, not configured.
-  This repository contains no deployment manifests or hosted configuration.
+- **Remote MCP is not publicly deployed.** The app exposes `/mcp` over
+  Streamable HTTP with OAuth, but deployment and live connector verification
+  have not been done. Local stdio remains available for Claude Desktop.
+- **stdio is a trusted local process.** It retains the existing unauthenticated
+  local transport and should only be launched by a trusted MCP client.
+- **Deployment is not live.** A Render Blueprint is prepared, but no Render
+  service or Neon project has been created and no public connector has been
+  tested. See [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
 
 ## Security guidance
 
@@ -351,9 +383,11 @@ Verified on 2026-11-11:
   environment file that belongs in Git.
 - Change the default PostgreSQL credentials for anything other than local
   development, and keep PostgreSQL bound to localhost.
-- Because there is no authentication, treat the API as a local-development
-  tool. Do not deploy or expose it without adding authentication and
-  authorization first.
+- Keep `OWNER_PASSWORD`, database credentials, session cookies, and OAuth
+  tokens private. Use HTTPS for hosted dashboard and MCP traffic.
+- Transport Host/Origin checks are separate from authentication. The dashboard
+  uses an HttpOnly session cookie plus CSRF token; remote MCP requires OAuth
+  bearer tokens.
 - No AI/LLM API keys belong in this codebase. Claude reaches the application
   only through MCP, and the MCP server needs no LLM credentials.
 - Database errors are translated into controlled client errors; server-side
@@ -370,6 +404,7 @@ Verified on 2026-11-11:
 
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — components, boundaries, and design rules
 - [`docs/DATABASE.md`](docs/DATABASE.md) — PostgreSQL setup, schema, and migrations
+- [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) — Render and Neon free-tier deployment preparation
 - [`docs/MCP.md`](docs/MCP.md) — MCP server and Claude Desktop configuration
 - [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md) — full development and verification guide
 - [`frontend/README.md`](frontend/README.md) — dashboard structure and Playwright setup

@@ -10,6 +10,7 @@ start it via ``docker compose up -d``.
 """
 
 import os
+import secrets
 import uuid
 from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
@@ -23,6 +24,10 @@ from mcp import Client
 from sqlalchemy import create_engine
 from sqlalchemy.engine import Engine, URL, make_url
 from sqlalchemy.orm import Session, sessionmaker
+
+# Every backend test process gets a fresh owner credential unless the test
+# runner explicitly supplied one. No reusable test password is committed.
+os.environ.setdefault("OWNER_PASSWORD", secrets.token_urlsafe(24))
 
 from app.api.deps import get_db_session
 from app.core.config import get_settings
@@ -129,6 +134,7 @@ def api_client(migrated_engine: Engine) -> Iterator[TestClient]:
     app.dependency_overrides[get_db_session] = override_get_db_session
     try:
         with TestClient(app) as client:
+            _authenticate_owner(client)
             yield client
     finally:
         app.dependency_overrides.clear()
@@ -154,9 +160,21 @@ async def shared_stack(migrated_engine: Engine, monkeypatch) -> AsyncIterator[tu
     monkeypatch.setattr(mcp_server_module, "SessionLocal", factory)
     try:
         with TestClient(app) as rest:
+            _authenticate_owner(rest)
             async with Client(mcp_server_module.mcp, mode="legacy") as mcp:
                 yield rest, mcp
     finally:
         app.dependency_overrides.clear()
         with migrated_engine.begin() as connection:
             connection.execute(sa.delete(Experiment))
+
+
+def _authenticate_owner(client: TestClient) -> None:
+    """Give existing REST integration tests an authenticated owner session."""
+    response = client.post(
+        "/api/v1/auth/login",
+        json={"password": get_settings().owner_password},
+        headers={"Origin": "http://localhost:5173"},
+    )
+    assert response.status_code == 200, response.text
+    client.headers["X-CSRF-Token"] = response.json()["csrf_token"]

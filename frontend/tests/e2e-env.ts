@@ -23,7 +23,7 @@ export const backendDir = join(repoRoot, 'backend')
 export const FRONTEND_PORT = 5174
 export const BACKEND_PORT = 8377
 export const FRONTEND_ORIGIN = `http://localhost:${FRONTEND_PORT}`
-export const BACKEND_ORIGIN = `http://127.0.0.1:${BACKEND_PORT}`
+export const BACKEND_ORIGIN = `http://localhost:${BACKEND_PORT}`
 
 /** Throwaway database used by the e2e suite (never the development database). */
 export const E2E_DATABASE_NAME = 'growthloop_e2e'
@@ -76,9 +76,25 @@ export function resolveE2eDatabaseUrl(): string {
   if (!url) {
     url = 'postgresql+psycopg://postgres:postgres@localhost:5432/growthloop'
   }
+  let parsed: URL
+  try {
+    parsed = new URL(url)
+  } catch {
+    throw new Error('Could not derive the isolated e2e database URL from DATABASE_URL.')
+  }
+  const hostname = parsed.hostname.toLowerCase()
+  const isLoopback =
+    hostname === 'localhost' ||
+    hostname === '[::1]' ||
+    /^127\.(?:25[0-5]|2[0-4]\d|1\d{2}|[1-9]?\d)(?:\.(?:25[0-5]|2[0-4]\d|1\d{2}|[1-9]?\d)){2}$/.test(
+      hostname,
+    )
+  if (!isLoopback) {
+    throw new Error('The e2e suite only permits a local PostgreSQL database.')
+  }
   const replaced = url.replace(/^(.*\/\/.*\/)[^/?]+(\?.*)?$/, `$1${E2E_DATABASE_NAME}$2`)
   if (!replaced.includes(`/${E2E_DATABASE_NAME}`)) {
-    throw new Error(`Could not derive the e2e database URL from: ${url}`)
+    throw new Error('Could not derive the isolated e2e database URL from DATABASE_URL.')
   }
   return replaced
 }

@@ -387,7 +387,13 @@ async def test_concurrent_cross_interface_updates_to_different_fields(
 
     transport = ASGITransport(app=app)
     async with AsyncClient(
-        transport=transport, base_url="http://testserver"
+        transport=transport,
+        base_url="http://testserver",
+        cookies={"growthloop_session": rest.cookies.get("growthloop_session")},
+        headers={
+            "Origin": "http://localhost:5173",
+            "X-CSRF-Token": rest.headers["X-CSRF-Token"],
+        },
     ) as http:
         rest_response, mcp_result = await asyncio.gather(
             http.patch(
@@ -420,7 +426,13 @@ async def test_concurrent_cross_interface_updates_to_same_field(
 
     transport = ASGITransport(app=app)
     async with AsyncClient(
-        transport=transport, base_url="http://testserver"
+        transport=transport,
+        base_url="http://testserver",
+        cookies={"growthloop_session": rest.cookies.get("growthloop_session")},
+        headers={
+            "Origin": "http://localhost:5173",
+            "X-CSRF-Token": rest.headers["X-CSRF-Token"],
+        },
     ) as http:
         rest_response, mcp_result = await asyncio.gather(
             http.patch(
