@@ -133,6 +133,7 @@ class OwnerAuthService:
         """Compare the synchronizer token without leaking match timing."""
         return bool(
             supplied_token
+            and supplied_token.isascii()
             and hmac.compare_digest(session.csrf_token, supplied_token)
         )
 

@@ -5,6 +5,8 @@ import hashlib
 import re
 import secrets
 import time
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from urllib.parse import parse_qs, urlencode, urlsplit
 
 import pytest
@@ -20,6 +22,7 @@ from mcp_server.oauth import (
     ACCESS_TOKEN_TTL_SECONDS,
     CLIENT_INACTIVITY_TTL_SECONDS,
     MAX_REGISTERED_CLIENTS,
+    OAUTH_REQUEST_TTL_SECONDS,
     GrowthLoopOAuthProvider,
     _BoundedRateLimiter,
 )
@@ -32,6 +35,17 @@ RESOURCE = "http://localhost:8000/mcp"
 @pytest.fixture()
 def oauth_client():
     with TestClient(create_app()) as client:
+        yield client
+
+
+@pytest.fixture()
+def production_oauth_client(monkeypatch):
+    """Exercise production consent checks without external services."""
+    import app.main as main_module
+
+    production_settings = get_settings().model_copy(update={"app_env": "production"})
+    monkeypatch.setattr(main_module, "get_settings", lambda: production_settings)
+    with TestClient(main_module.create_app(), base_url="https://testserver") as client:
         yield client
 
 
@@ -120,6 +134,34 @@ def _complete_consent(
     return approve.headers["location"]
 
 
+def _consent_request_id(consent_location: str) -> str:
+    return parse_qs(urlsplit(consent_location).query)["request_id"][0]
+
+
+def _consent_page(client: TestClient, request_id: str):
+    response = client.get(
+        f"/oauth/consent?{urlencode({'request_id': request_id})}"
+    )
+    assert response.status_code == 200
+    return response
+
+
+def _login_for_consent(
+    client: TestClient, request_id: str, nonce: str, *, origin: str | None
+):
+    headers = {"Origin": origin} if origin is not None else {}
+    return client.post(
+        f"/oauth/consent?{urlencode({'request_id': request_id})}",
+        data={
+            "approval_nonce": nonce,
+            "password": get_settings().owner_password,
+            "action": "login",
+        },
+        headers=headers,
+        follow_redirects=False,
+    )
+
+
 def _obtain_tokens(client: TestClient) -> tuple[str, str, str]:
     client_id, redirect_uri, verifier, authorize = _start_authorization(client)
     assert authorize.status_code == 302, authorize.text
@@ -140,6 +182,294 @@ def _obtain_tokens(client: TestClient) -> tuple[str, str, str]:
     )
     assert token.status_code == 200, token.text
     return client_id, query["code"][0], token.json()
+
+
+def test_production_consent_accepts_opaque_origin_with_bound_csrf(
+    production_oauth_client,
+):
+    _, _, _, authorize = _start_authorization(production_oauth_client)
+    assert authorize.status_code == 302
+    request_id = _consent_request_id(authorize.headers["location"])
+    page = _consent_page(production_oauth_client, request_id)
+    nonce = _hidden_value(page.text, "approval_nonce")
+
+    login = _login_for_consent(
+        production_oauth_client, request_id, nonce, origin="null"
+    )
+    assert login.status_code == 303
+
+    page = _consent_page(production_oauth_client, request_id)
+    approve = production_oauth_client.post(
+        f"/oauth/consent?{urlencode({'request_id': request_id})}",
+        data={
+            "approval_nonce": nonce,
+            "csrf_token": _hidden_value(page.text, "csrf_token"),
+            "action": "approve",
+        },
+        headers={"Origin": "null"},
+        follow_redirects=False,
+    )
+
+    assert approve.status_code == 303
+    query = parse_qs(urlsplit(approve.headers["location"]).query)
+    assert query["state"] == ["oauth-security-state"]
+    assert query["iss"] == [get_settings().mcp_issuer_url]
+
+
+def test_production_consent_accepts_exact_issuer_origin(production_oauth_client):
+    _, _, _, authorize = _start_authorization(production_oauth_client)
+    request_id = _consent_request_id(authorize.headers["location"])
+    page = _consent_page(production_oauth_client, request_id)
+    nonce = _hidden_value(page.text, "approval_nonce")
+    login = _login_for_consent(
+        production_oauth_client, request_id, nonce, origin=ISSUER_ORIGIN
+    )
+    assert login.status_code == 303
+
+    page = _consent_page(production_oauth_client, request_id)
+    approve = production_oauth_client.post(
+        f"/oauth/consent?{urlencode({'request_id': request_id})}",
+        data={
+            "approval_nonce": nonce,
+            "csrf_token": _hidden_value(page.text, "csrf_token"),
+            "action": "approve",
+        },
+        headers={"Origin": ISSUER_ORIGIN},
+        follow_redirects=False,
+    )
+
+    assert approve.status_code == 303
+
+
+@pytest.mark.parametrize("origin", [ORIGIN, "https://unconfigured.example"])
+def test_production_consent_rejects_disallowed_origin(
+    production_oauth_client, origin
+):
+    _, _, _, authorize = _start_authorization(production_oauth_client)
+    request_id = _consent_request_id(authorize.headers["location"])
+    page = _consent_page(production_oauth_client, request_id)
+    nonce = _hidden_value(page.text, "approval_nonce")
+    login = _login_for_consent(
+        production_oauth_client, request_id, nonce, origin=ISSUER_ORIGIN
+    )
+    assert login.status_code == 303
+
+    page = _consent_page(production_oauth_client, request_id)
+    response = production_oauth_client.post(
+        f"/oauth/consent?{urlencode({'request_id': request_id})}",
+        data={
+            "approval_nonce": nonce,
+            "csrf_token": _hidden_value(page.text, "csrf_token"),
+            "action": "approve",
+        },
+        headers={"Origin": origin},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 403
+    assert response.text == "The request origin is not allowed."
+
+
+@pytest.mark.parametrize("action", ["approve", "deny"])
+def test_production_consent_requires_session_and_csrf_for_opaque_or_missing_origin(
+    production_oauth_client, action
+):
+    _, _, _, authorize = _start_authorization(production_oauth_client)
+    request_id = _consent_request_id(authorize.headers["location"])
+    page = _consent_page(production_oauth_client, request_id)
+    nonce = _hidden_value(page.text, "approval_nonce")
+
+    endpoint = f"/oauth/consent?{urlencode({'request_id': request_id})}"
+    form = {"approval_nonce": nonce, "action": action}
+    unauthenticated = production_oauth_client.post(
+        endpoint,
+        data={**form, "csrf_token": "untrusted-token"},
+        headers={"Origin": "null"},
+        follow_redirects=False,
+    )
+    assert unauthenticated.status_code == 403
+
+    login = _login_for_consent(
+        production_oauth_client, request_id, nonce, origin="null"
+    )
+    assert login.status_code == 303
+
+    page = _consent_page(production_oauth_client, request_id)
+    missing = production_oauth_client.post(
+        endpoint, data=form, headers={"Origin": "null"}, follow_redirects=False
+    )
+    invalid = production_oauth_client.post(
+        endpoint,
+        data={**form, "csrf_token": "invalid-token"},
+        headers={"Origin": "null"},
+        follow_redirects=False,
+    )
+    non_ascii = production_oauth_client.post(
+        endpoint,
+        data={**form, "csrf_token": "\u2603"},
+        headers={"Origin": "null"},
+        follow_redirects=False,
+    )
+    csrf_token = _hidden_value(page.text, "csrf_token")
+    missing_origin = production_oauth_client.post(
+        endpoint,
+        data={**form, "csrf_token": csrf_token},
+        follow_redirects=False,
+    )
+
+    assert missing.status_code == 403
+    assert invalid.status_code == 403
+    assert non_ascii.status_code == 403
+    assert missing_origin.status_code == 303
+    if action == "deny":
+        assert parse_qs(urlsplit(missing_origin.headers["location"]).query)[
+            "error"
+        ] == ["access_denied"]
+
+
+def test_consent_nonce_is_unpredictable_and_expires_with_request(
+    production_oauth_client,
+):
+    _, _, _, authorize = _start_authorization(production_oauth_client)
+    request_id = _consent_request_id(authorize.headers["location"])
+    provider = production_oauth_client.app.state.oauth_provider
+    pending = provider._requests[request_id]
+    nonce = pending.approval_nonce
+
+    assert len(nonce) == 43  # secrets.token_urlsafe(32), or 256 random bits.
+    assert nonce != request_id
+    assert 0 < pending.expires_at - time.time() <= OAUTH_REQUEST_TTL_SECONDS
+    assert provider.verify_consent_nonce(request_id, nonce)
+    assert provider.complete_consent(
+        request_id, f"{nonce}wrong", approved=True
+    ) is None
+    assert provider.verify_consent_nonce(request_id, nonce)
+
+    provider._requests[request_id] = replace(
+        pending, expires_at=time.time() - 1
+    )
+
+    assert not provider.verify_consent_nonce(request_id, nonce)
+    assert provider.get_consent_request(request_id) is None
+    assert provider.complete_consent(request_id, nonce, approved=True) is None
+
+
+def test_consent_rejects_non_ascii_nonce_safely(production_oauth_client):
+    _, _, _, authorize = _start_authorization(production_oauth_client)
+    request_id = _consent_request_id(authorize.headers["location"])
+    response = production_oauth_client.post(
+        f"/oauth/consent?{urlencode({'request_id': request_id})}",
+        data={
+            "approval_nonce": "\u2603",
+            "password": "not-a-real-password",
+            "action": "login",
+        },
+        headers={"Origin": "null"},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 400
+    assert "Traceback" not in response.text
+
+
+@pytest.mark.parametrize("action", ["approve", "deny"])
+def test_consent_nonce_cannot_be_replayed_after_completion(
+    production_oauth_client, action
+):
+    _, _, _, authorize = _start_authorization(production_oauth_client)
+    request_id = _consent_request_id(authorize.headers["location"])
+    page = _consent_page(production_oauth_client, request_id)
+    nonce = _hidden_value(page.text, "approval_nonce")
+    login = _login_for_consent(
+        production_oauth_client, request_id, nonce, origin=ISSUER_ORIGIN
+    )
+    assert login.status_code == 303
+
+    page = _consent_page(production_oauth_client, request_id)
+    endpoint = f"/oauth/consent?{urlencode({'request_id': request_id})}"
+    form = {
+        "approval_nonce": nonce,
+        "csrf_token": _hidden_value(page.text, "csrf_token"),
+        "action": action,
+    }
+    first = production_oauth_client.post(
+        endpoint,
+        data=form,
+        headers={"Origin": "null"},
+        follow_redirects=False,
+    )
+    replay = production_oauth_client.post(
+        endpoint,
+        data=form,
+        headers={"Origin": "null"},
+        follow_redirects=False,
+    )
+
+    assert first.status_code == 303
+    assert replay.status_code == 400
+
+
+def test_concurrent_consent_submissions_consume_request_once(
+    production_oauth_client,
+):
+    _, _, _, authorize = _start_authorization(production_oauth_client)
+    request_id = _consent_request_id(authorize.headers["location"])
+    nonce = _hidden_value(
+        _consent_page(production_oauth_client, request_id).text,
+        "approval_nonce",
+    )
+    provider = production_oauth_client.app.state.oauth_provider
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(
+            executor.map(
+                lambda approved: provider.complete_consent(
+                    request_id, nonce, approved=approved
+                ),
+                [True, False],
+            )
+        )
+
+    assert sum(result is not None for result in results) == 1
+    assert provider.get_consent_request(request_id) is None
+    assert len(provider._codes) <= 1
+
+
+def test_consent_nonce_is_bound_to_its_authorization_request(
+    production_oauth_client,
+):
+    _, _, _, authorize_a = _start_authorization(production_oauth_client)
+    _, _, _, authorize_b = _start_authorization(production_oauth_client)
+    request_a = _consent_request_id(authorize_a.headers["location"])
+    request_b = _consent_request_id(authorize_b.headers["location"])
+    page_a = _consent_page(production_oauth_client, request_a)
+    nonce_a = _hidden_value(page_a.text, "approval_nonce")
+    login = _login_for_consent(
+        production_oauth_client, request_a, nonce_a, origin=ISSUER_ORIGIN
+    )
+    assert login.status_code == 303
+
+    page_b = _consent_page(production_oauth_client, request_b)
+    nonce_b = _hidden_value(page_b.text, "approval_nonce")
+    assert nonce_a != nonce_b
+    assert len(nonce_a) == len(nonce_b) == 43
+    csrf_token = _hidden_value(page_b.text, "csrf_token")
+    endpoint_b = f"/oauth/consent?{urlencode({'request_id': request_b})}"
+    mismatched = production_oauth_client.post(
+        endpoint_b,
+        data={
+            "approval_nonce": nonce_a,
+            "csrf_token": csrf_token,
+            "action": "approve",
+        },
+        headers={"Origin": "null"},
+        follow_redirects=False,
+    )
+
+    assert mismatched.status_code == 400
+    assert production_oauth_client.app.state.oauth_provider.verify_consent_nonce(
+        request_b, nonce_b
+    )
 
 
 @pytest.mark.parametrize(
