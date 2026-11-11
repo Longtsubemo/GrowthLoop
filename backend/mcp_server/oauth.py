@@ -364,6 +364,14 @@ class OAuthSecurityMiddleware:
                 try:
                     payload = json.loads(body)
                     payload["authorization_response_iss_parameter_supported"] = True
+                    auth_methods = payload.get(
+                        "token_endpoint_auth_methods_supported"
+                    )
+                    if not isinstance(auth_methods, list):
+                        auth_methods = []
+                    if "none" not in auth_methods:
+                        auth_methods.append("none")
+                    payload["token_endpoint_auth_methods_supported"] = auth_methods
                     body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
                     start = dict(start_message or {})
                     start_headers = [

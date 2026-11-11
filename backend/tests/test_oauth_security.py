@@ -601,6 +601,7 @@ def test_metadata_advertises_issuer_parameter_and_oauth_cors_is_exact(oauth_clie
 
     assert metadata.status_code == 200
     assert metadata.json()["authorization_response_iss_parameter_supported"] is True
+    assert "none" in metadata.json()["token_endpoint_auth_methods_supported"]
     assert metadata.headers["access-control-allow-origin"] == ORIGIN
     assert metadata.headers["access-control-allow-origin"] != "*"
 
@@ -768,6 +769,71 @@ def test_valid_oauth_token_can_list_mcp_tools_without_database(oauth_client):
     assert response.status_code == 200, response.text
     names = {tool["name"] for tool in response.json()["result"]["tools"]}
     assert len(names) == 7
+
+
+def test_claude_callback_token_exchange_and_mcp_request_work_end_to_end(oauth_client):
+    redirect_uri = "https://claude.ai/api/mcp/auth_callback"
+    client_id, _, verifier, authorize = _start_authorization(
+        oauth_client, redirect_uri=redirect_uri
+    )
+    assert authorize.status_code == 302
+
+    callback = _complete_consent(oauth_client, authorize.headers["location"])
+    callback_url = urlsplit(callback)
+    assert (
+        f"{callback_url.scheme}://{callback_url.netloc}{callback_url.path}"
+        == redirect_uri
+    )
+    callback_params = parse_qs(callback_url.query)
+    assert callback_params["state"] == ["oauth-security-state"]
+    assert callback_params["iss"] == [get_settings().mcp_issuer_url]
+
+    token_response = oauth_client.post(
+        "/token",
+        data={
+            "grant_type": "authorization_code",
+            "client_id": client_id,
+            "code": callback_params["code"][0],
+            "redirect_uri": redirect_uri,
+            "code_verifier": verifier,
+            "resource": RESOURCE,
+        },
+    )
+    assert token_response.status_code == 200
+    token_payload = token_response.json()
+    assert token_payload["token_type"] == "Bearer"
+    assert token_payload["expires_in"] == ACCESS_TOKEN_TTL_SECONDS
+    assert token_payload["scope"] == "experiments"
+    assert "refresh_token" in token_payload
+
+    headers = {
+        "Authorization": f"Bearer {token_payload['access_token']}",
+        "Accept": "application/json, text/event-stream",
+        "Origin": ORIGIN,
+    }
+    initialize = oauth_client.post(
+        "/mcp",
+        json={
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {},
+                "clientInfo": {"name": "claude-oauth-regression", "version": "1"},
+            },
+        },
+        headers=headers,
+    )
+    assert initialize.status_code == 200
+    tools = oauth_client.post(
+        "/mcp",
+        json={"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+        headers=headers,
+    )
+
+    assert tools.status_code == 200
+    assert len(tools.json()["result"]["tools"]) == 7
 
 
 def test_registration_rate_limit_returns_safe_retry_response(oauth_client):
