@@ -60,7 +60,7 @@ async def test_correct_owner_password_issues_httponly_session(auth_client):
     assert auth_client.get("/api/v1/auth/session").json()["authenticated"] is True
 
 
-def test_production_owner_cookie_is_secure():
+def test_production_owner_cookie_supports_cross_site_api_requests():
     auth_service = OwnerAuthService(
         get_settings().owner_password,
         session_ttl_seconds=3600,
@@ -73,7 +73,28 @@ def test_production_owner_cookie_is_secure():
     cookie = response.headers["set-cookie"].lower()
     assert "secure" in cookie
     assert "httponly" in cookie
-    assert "samesite=lax" in cookie
+    assert "samesite=none" in cookie
+    assert "path=/" in cookie
+    assert "max-age=3600" in cookie
+    assert "domain=" not in cookie
+
+
+def test_production_cookie_deletion_uses_matching_scope():
+    auth_service = OwnerAuthService(
+        get_settings().owner_password,
+        session_ttl_seconds=3600,
+        secure_cookie=True,
+        allowed_origins=[ORIGIN],
+    )
+    response = Response()
+    auth_service.clear_session_cookie(response)
+
+    cookie = response.headers["set-cookie"].lower()
+    assert "secure" in cookie
+    assert "httponly" in cookie
+    assert "samesite=none" in cookie
+    assert "path=/" in cookie
+    assert "domain=" not in cookie
 
 
 async def test_incorrect_owner_password_returns_generic_error(auth_client):

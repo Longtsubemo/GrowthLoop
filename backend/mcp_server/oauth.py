@@ -364,6 +364,14 @@ class OAuthSecurityMiddleware:
                 try:
                     payload = json.loads(body)
                     payload["authorization_response_iss_parameter_supported"] = True
+                    auth_methods = payload.get(
+                        "token_endpoint_auth_methods_supported"
+                    )
+                    if not isinstance(auth_methods, list):
+                        auth_methods = []
+                    if "none" not in auth_methods:
+                        auth_methods.append("none")
+                    payload["token_endpoint_auth_methods_supported"] = auth_methods
                     body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
                     start = dict(start_message or {})
                     start_headers = [
@@ -699,7 +707,9 @@ class GrowthLoopOAuthProvider(
     def verify_consent_nonce(self, request_id: str, nonce: str) -> bool:
         consent = self.get_consent_request(request_id)
         return bool(
-            consent and hmac.compare_digest(consent.approval_nonce, nonce)
+            consent
+            and nonce.isascii()
+            and hmac.compare_digest(consent.approval_nonce, nonce)
         )
 
     def complete_consent(
@@ -707,12 +717,14 @@ class GrowthLoopOAuthProvider(
     ) -> str | None:
         with self._lock:
             pending = self._requests.get(request_id)
-            if (
-                pending is None
-                or pending.expires_at <= time.time()
-                or not hmac.compare_digest(pending.approval_nonce, nonce)
-            ):
+            if pending is None:
+                return None
+            if pending.expires_at <= time.time():
                 self._requests.pop(request_id, None)
+                return None
+            if not nonce.isascii() or not hmac.compare_digest(
+                pending.approval_nonce, nonce
+            ):
                 return None
             self._requests.pop(request_id, None)
             params = pending.params
@@ -871,8 +883,15 @@ def register_consent_route(
             )
 
         origin = request.headers.get("origin")
-        if (origin and origin not in owner_auth.allowed_origins) or (
-            production and origin != issuer_origin
+        # Browser forms submitted from an opaque-origin context serialize
+        # Origin as "null". Some clients may omit it entirely. Keep exact
+        # origin checks whenever a usable origin is present; for absent or
+        # opaque origins, the request-bound approval nonce below is required,
+        # and an authenticated approval also requires the session CSRF token.
+        origin_unavailable = origin is None or origin == "null"
+        if not origin_unavailable and (
+            origin not in owner_auth.allowed_origins
+            or (production and origin != issuer_origin)
         ):
             return _consent_response("The request origin is not allowed.", status_code=403)
 
@@ -882,7 +901,10 @@ def register_consent_route(
             return _consent_response("Invalid authorization request.", status_code=400)
         nonce = str(form.get("approval_nonce", ""))
         if not provider.verify_consent_nonce(request_id, nonce):
-            return _consent_response("This authorization request has expired.", status_code=400)
+            return _consent_response(
+                "This authorization request has expired or is invalid.",
+                status_code=400,
+            )
 
         if form.get("action") == "login":
             password = str(form.get("password", ""))

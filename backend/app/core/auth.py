@@ -133,6 +133,7 @@ class OwnerAuthService:
         """Compare the synchronizer token without leaking match timing."""
         return bool(
             supplied_token
+            and supplied_token.isascii()
             and hmac.compare_digest(session.csrf_token, supplied_token)
         )
 
@@ -144,7 +145,7 @@ class OwnerAuthService:
             path="/",
             secure=self.secure_cookie,
             httponly=True,
-            samesite="lax",
+            samesite="none" if self.secure_cookie else "lax",
         )
 
     def clear_session_cookie(self, response) -> None:
@@ -153,7 +154,7 @@ class OwnerAuthService:
             path="/",
             secure=self.secure_cookie,
             httponly=True,
-            samesite="lax",
+            samesite="none" if self.secure_cookie else "lax",
         )
 
     @staticmethod
