@@ -758,6 +758,7 @@ class ConsentRequest:
     client_name: str
     scopes: tuple[str, ...]
     approval_nonce: str
+    redirect_origin: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -974,6 +975,7 @@ class GrowthLoopOAuthProvider(
                 client_name=client.client_name or "Remote MCP client",
                 scopes=tuple(pending.params.scopes or [OAUTH_SCOPE]),
                 approval_nonce=pending.approval_nonce,
+                redirect_origin=_redirect_uri_origin(str(pending.params.redirect_uri)),
             )
 
     def verify_consent_nonce(self, request_id: str, nonce: str) -> bool:
@@ -1151,7 +1153,8 @@ def register_consent_route(
                     authenticated=session is not None,
                     message=None,
                     csrf_token=session.csrf_token if session else None,
-                )
+                ),
+                form_action_origin=consent.redirect_origin,
             )
 
         origin = request.headers.get("origin")
@@ -1188,6 +1191,7 @@ def register_consent_route(
                         message="The password is incorrect.",
                     ),
                     status_code=401,
+                    form_action_origin=consent.redirect_origin,
                 )
             try:
                 new_session_id, _ = owner_auth.login(
@@ -1202,6 +1206,7 @@ def register_consent_route(
                         message="Too many attempts. Try again later.",
                     ),
                     status_code=429,
+                    form_action_origin=consent.redirect_origin,
                 )
             except InvalidOwnerPassword:
                 return _consent_response(
@@ -1211,6 +1216,7 @@ def register_consent_route(
                         message="The password is incorrect.",
                     ),
                     status_code=401,
+                    form_action_origin=consent.redirect_origin,
                 )
             response = RedirectResponse(
                 url=f"/oauth/consent?{urlencode({'request_id': request_id})}",
@@ -1232,6 +1238,7 @@ def register_consent_route(
                     csrf_token=session.csrf_token if session else None,
                 ),
                 status_code=403,
+                form_action_origin=consent.redirect_origin,
             )
 
         approved = form.get("action") == "approve"
@@ -1291,7 +1298,15 @@ def _consent_html(
     )
 
 
-def _consent_response(body: str, *, status_code: int = 200) -> HTMLResponse:
+def _consent_response(
+    body: str,
+    *,
+    status_code: int = 200,
+    form_action_origin: str | None = None,
+) -> HTMLResponse:
+    form_action_sources = "'self'"
+    if form_action_origin:
+        form_action_sources += f" {form_action_origin}"
     return HTMLResponse(
         body,
         status_code=status_code,
@@ -1299,13 +1314,19 @@ def _consent_response(body: str, *, status_code: int = 200) -> HTMLResponse:
             "Cache-Control": "no-store",
             "Content-Security-Policy": (
                 f"default-src 'none'; script-src 'sha256-{_CONSENT_SUBMIT_SCRIPT_HASH}'; "
-                "form-action 'self'; base-uri 'none'; "
+                f"form-action {form_action_sources}; base-uri 'none'; "
                 "frame-ancestors 'none'"
             ),
             "Referrer-Policy": "no-referrer",
             "X-Content-Type-Options": "nosniff",
         },
     )
+
+
+def _redirect_uri_origin(redirect_uri: str) -> str:
+    """Return the authority origin of an already-validated OAuth redirect URI."""
+    parsed = urlsplit(redirect_uri)
+    return urlunsplit((parsed.scheme, parsed.netloc, "", "", ""))
 
 
 def _client_key(request: Request) -> str:

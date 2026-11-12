@@ -462,6 +462,30 @@ def test_consent_form_prevents_repeat_submission_and_preserves_action(
     assert "'unsafe-inline'" not in csp
 
 
+@pytest.mark.parametrize(
+    ("redirect_uri", "expected_origin"),
+    [
+        ("https://claude.ai/api/mcp/auth_callback", "https://claude.ai"),
+        ("https://callback.example:8443/oauth/return", "https://callback.example:8443"),
+        ("http://127.0.0.1:43127/callback", "http://127.0.0.1:43127"),
+    ],
+)
+def test_consent_csp_allows_only_the_registered_redirect_origin(
+    oauth_client, redirect_uri, expected_origin
+):
+    _, _, _, authorize = _start_authorization(
+        oauth_client, redirect_uri=redirect_uri
+    )
+    request_id = _consent_request_id(authorize.headers["location"])
+    consent_page = _consent_page(oauth_client, request_id)
+    csp = consent_page.headers["content-security-policy"]
+    form_action_sources = csp.split("form-action ", 1)[1].split(";", 1)[0]
+
+    assert form_action_sources.split() == ["'self'", expected_origin]
+    assert "'unsafe-inline'" not in csp
+    assert 'action="?' in consent_page.text
+
+
 def test_concurrent_consent_submissions_consume_request_once(
     production_oauth_client,
 ):
