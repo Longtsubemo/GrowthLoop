@@ -8,6 +8,7 @@ import hmac
 import html
 import ipaddress
 import json
+import logging
 import re
 import secrets
 import threading
@@ -40,6 +41,7 @@ from app.core.auth import (
 )
 
 OAUTH_SCOPE = "experiments"
+logger = logging.getLogger(__name__)
 ACCESS_TOKEN_TTL_SECONDS = 900
 REFRESH_TOKEN_TTL_SECONDS = 30 * 24 * 60 * 60
 AUTHORIZATION_CODE_TTL_SECONDS = 180
@@ -53,6 +55,22 @@ DCR_RATE_LIMIT_WINDOW_SECONDS = 60 * 60
 DCR_RATE_LIMIT_REQUESTS = 10
 MAX_DCR_RATE_LIMIT_KEYS = 2048
 MAX_TOKEN_REQUEST_BODY_BYTES = 64 * 1024
+MAX_DIAGNOSTIC_BODY_BYTES = 64 * 1024
+MAX_DIAGNOSTIC_RESPONSE_BYTES = 8 * 1024
+_TOKEN_ERROR_CATEGORIES = frozenset(
+    {
+        "invalid_request",
+        "invalid_client",
+        "invalid_grant",
+        "unauthorized_client",
+        "unsupported_grant_type",
+        "invalid_scope",
+        "invalid_target",
+        "temporarily_unavailable",
+        "server_error",
+    }
+)
+_MCP_INITIALIZATION_METHODS = frozenset({"initialize", "server/discover"})
 _OAUTH_ENDPOINTS = {
     "/authorize",
     "/register",
@@ -211,6 +229,113 @@ class OAuthCorsPreflightGuardMiddleware:
         await self.app(scope, receive, send)
 
 
+def _token_failure_category(body: bytes, *, truncated: bool) -> str:
+    if truncated:
+        return "unclassified"
+    try:
+        payload = json.loads(body)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return "unclassified"
+    error = payload.get("error") if isinstance(payload, dict) else None
+    if isinstance(error, str) and error in _TOKEN_ERROR_CATEGORIES:
+        return error
+    return "unclassified"
+
+
+def _mcp_startup_method(body: bytes, *, truncated: bool) -> str | None:
+    if truncated:
+        return None
+    try:
+        payload = json.loads(body)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    method = payload.get("method") if isinstance(payload, dict) else None
+    if isinstance(method, str) and method in _MCP_INITIALIZATION_METHODS:
+        return method
+    return None
+
+
+def _mcp_http_failure_category(status: int) -> str:
+    if status == 401:
+        return "unauthorized"
+    if status == 403:
+        return "origin_or_host_rejected"
+    if status == 400:
+        return "bad_request"
+    if status == 404:
+        return "not_found"
+    if status >= 500:
+        return "server_error"
+    return "http_error"
+
+
+def _mcp_startup_outcome(
+    body: bytes,
+    request_body: bytes,
+    *,
+    status: int,
+    method: str,
+    truncated: bool,
+    request_truncated: bool,
+) -> str:
+    if status == 401:
+        return "unauthorized"
+    if status == 403:
+        return "origin_or_host_rejected"
+    if status >= 500:
+        return "server_error"
+    if truncated:
+        return "unclassified"
+    try:
+        payload = json.loads(body)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return "unclassified"
+    if not isinstance(payload, dict):
+        return "unclassified"
+    try:
+        request = json.loads(request_body) if not request_truncated else None
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        request = None
+    params = request.get("params") if isinstance(request, dict) else None
+    result = payload.get("result")
+    if isinstance(result, dict):
+        if method == "initialize" and isinstance(params, dict):
+            requested_version = params.get("protocolVersion")
+            if result.get("protocolVersion") == requested_version:
+                return "success"
+            if isinstance(result.get("protocolVersion"), str):
+                return "protocol_version_counteroffer"
+        if method == "server/discover" and isinstance(params, dict):
+            metadata = params.get("_meta")
+            requested_version = (
+                metadata.get("io.modelcontextprotocol/protocolVersion")
+                if isinstance(metadata, dict)
+                else None
+            )
+            supported_versions = result.get("supportedVersions")
+            if isinstance(supported_versions, list):
+                return (
+                    "success"
+                    if requested_version in supported_versions
+                    else "unsupported_protocol_version"
+                )
+    error = payload.get("error")
+    if isinstance(error, dict):
+        code_categories = {
+            -32020: "routing_header_mismatch",
+            -32022: "unsupported_protocol_version",
+            -32600: "invalid_request",
+            -32602: "invalid_params",
+        }
+        category = code_categories.get(error.get("code"))
+        if category:
+            return category
+        return "jsonrpc_error"
+    if status >= 400:
+        return "http_error"
+    return "unexpected_response"
+
+
 class OAuthSecurityMiddleware:
     """Apply exact Origin policy and resource validation around SDK routes.
 
@@ -249,6 +374,10 @@ class OAuthSecurityMiddleware:
         is_oauth_endpoint = path in self._OAUTH_ENDPOINTS
 
         if is_oauth_endpoint and origin and origin not in self.allowed_origins:
+            if path == "/token":
+                logger.warning(
+                    "oauth token exchange outcome=failed status=403 category=origin_rejected"
+                )
             await self._json_error(
                 send,
                 status=403,
@@ -272,6 +401,9 @@ class OAuthSecurityMiddleware:
                 return
             body, too_large = await self._read_limited_body(receive)
             if too_large:
+                logger.warning(
+                    "oauth token exchange outcome=failed status=413 category=request_too_large"
+                )
                 await self._json_error(
                     send,
                     status=413,
@@ -327,9 +459,21 @@ class OAuthSecurityMiddleware:
             except (UnicodeDecodeError, ValueError):
                 form = {}
             resources = form.get("resource", [])
-            if content_type != b"application/x-www-form-urlencoded" or resources != [
-                self.resource_url
-            ]:
+            if content_type != b"application/x-www-form-urlencoded":
+                logger.warning(
+                    "oauth token exchange outcome=failed status=400 category=invalid_request"
+                )
+                await self._json_error(
+                    send,
+                    status=400,
+                    error="invalid_target",
+                    description="The requested resource is not GrowthLoop MCP.",
+                )
+                return
+            if resources != [self.resource_url]:
+                logger.warning(
+                    "oauth token exchange outcome=failed status=400 category=invalid_target"
+                )
                 await self._json_error(
                     send,
                     status=400,
@@ -349,30 +493,131 @@ class OAuthSecurityMiddleware:
 
             replay_receive = replay_receive
 
+        mcp_request_body = bytearray()
+        mcp_request_truncated = False
+        mcp_response_body = bytearray()
+        mcp_response_truncated = False
+        token_error_body = bytearray()
+        token_error_truncated = False
+        response_status: int | None = None
+
         async def secure_send(message):
-            if message["type"] != "http.response.start":
+            nonlocal response_status
+            nonlocal mcp_response_truncated, token_error_truncated
+
+            if message["type"] == "http.response.start":
+                response_status = int(message["status"])
+                if path == "/mcp" and method == "POST" and response_status >= 400:
+                    mcp_method = _mcp_startup_method(
+                        bytes(mcp_request_body), truncated=mcp_request_truncated
+                    )
+                    if mcp_method is None:
+                        logger.warning(
+                            "mcp request outcome=failed status=%d category=%s "
+                            "bearer_present=%s origin_present=%s",
+                            response_status,
+                            _mcp_http_failure_category(response_status),
+                            b"authorization" in headers,
+                            origin_header is not None,
+                        )
+
+                message_headers = list(message.get("headers", []))
+                if is_oauth_endpoint:
+                    # SDK OAuth routes allow '*'. The outer FastAPI CORS middleware
+                    # supplies ACAO only for its exact configured origin list.
+                    message_headers = [
+                        (key, value)
+                        for key, value in message_headers
+                        if key.lower() != b"access-control-allow-origin"
+                    ]
+
+                if path == "/authorize":
+                    message_headers = self._add_issuer_to_redirect(message_headers)
+
+                await send({**message, "headers": message_headers})
+                return
+
+            if message["type"] == "http.response.body":
+                chunk = message.get("body", b"")
+                if (
+                    path == "/token"
+                    and response_status is not None
+                    and response_status >= 400
+                    and len(token_error_body) + len(chunk) <= MAX_DIAGNOSTIC_RESPONSE_BYTES
+                ):
+                    token_error_body.extend(chunk)
+                elif path == "/token" and response_status is not None and response_status >= 400:
+                    token_error_truncated = True
+
+                mcp_method = (
+                    _mcp_startup_method(
+                        bytes(mcp_request_body), truncated=mcp_request_truncated
+                    )
+                    if path == "/mcp" and method == "POST"
+                    else None
+                )
+                if mcp_method is not None:
+                    if len(mcp_response_body) + len(chunk) <= MAX_DIAGNOSTIC_RESPONSE_BYTES:
+                        mcp_response_body.extend(chunk)
+                    else:
+                        mcp_response_truncated = True
+
+                if not message.get("more_body", False):
+                    if path == "/token" and response_status is not None:
+                        if response_status < 400:
+                            logger.info(
+                                "oauth token exchange outcome=success status=%d",
+                                response_status,
+                            )
+                        else:
+                            logger.warning(
+                                "oauth token exchange outcome=failed status=%d category=%s",
+                                response_status,
+                                _token_failure_category(
+                                    bytes(token_error_body), truncated=token_error_truncated
+                                ),
+                            )
+                    if mcp_method is not None and response_status is not None:
+                        outcome = _mcp_startup_outcome(
+                            bytes(mcp_response_body),
+                            bytes(mcp_request_body),
+                            status=response_status,
+                            method=mcp_method,
+                            truncated=mcp_response_truncated,
+                            request_truncated=mcp_request_truncated,
+                        )
+                        log = logger.info if outcome == "success" else logger.warning
+                        log(
+                            "mcp initialization outcome=%s method=%s status=%d",
+                            outcome,
+                            mcp_method,
+                            response_status,
+                        )
                 await send(message)
                 return
 
-            message_headers = list(message.get("headers", []))
-            if is_oauth_endpoint:
-                # SDK OAuth routes allow '*'. The outer FastAPI CORS middleware
-                # supplies ACAO only for its exact configured origin list.
-                message_headers = [
-                    (key, value)
-                    for key, value in message_headers
-                    if key.lower() != b"access-control-allow-origin"
-                ]
-
-            if path == "/authorize":
-                message_headers = self._add_issuer_to_redirect(message_headers)
-
-            await send({**message, "headers": message_headers})
+            await send(message)
 
         if path == "/.well-known/oauth-authorization-server":
             await self._send_metadata_with_issuer_support(scope, replay_receive, secure_send)
             return
-        await self.app(scope, replay_receive, secure_send)
+
+        application_receive = replay_receive
+        if path == "/mcp" and method == "POST":
+            async def capture_mcp_request_body():
+                nonlocal mcp_request_truncated
+                request_message = await replay_receive()
+                if request_message["type"] == "http.request":
+                    chunk = request_message.get("body", b"")
+                    if len(mcp_request_body) + len(chunk) <= MAX_DIAGNOSTIC_BODY_BYTES:
+                        mcp_request_body.extend(chunk)
+                    else:
+                        mcp_request_truncated = True
+                return request_message
+
+            application_receive = capture_mcp_request_body
+
+        await self.app(scope, application_receive, secure_send)
 
     async def _send_metadata_with_issuer_support(self, scope, receive, send) -> None:
         start_message = None

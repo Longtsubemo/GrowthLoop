@@ -18,6 +18,7 @@ from mcp.client.auth.utils import validate_authorization_response_iss
 
 from app.core.config import get_settings
 from app.main import create_app
+import mcp_server.oauth as oauth_module
 from mcp_server.oauth import (
     ACCESS_TOKEN_TTL_SECONDS,
     CLIENT_INACTIVITY_TTL_SECONDS,
@@ -71,6 +72,17 @@ def _hidden_value(body: str, name: str) -> str:
     )
     assert match, f"missing hidden form value {name}"
     return match.group(1)
+
+
+def _capture_oauth_diagnostics(monkeypatch) -> list[str]:
+    messages: list[str] = []
+
+    def capture(message: str, *args) -> None:
+        messages.append(message % args if args else message)
+
+    monkeypatch.setattr(oauth_module.logger, "info", capture)
+    monkeypatch.setattr(oauth_module.logger, "warning", capture)
+    return messages
 
 
 def _start_authorization(
@@ -697,11 +709,25 @@ def test_denial_authorization_response_includes_issuer(oauth_client):
 
 
 @pytest.mark.anyio
-async def test_code_exchange_binds_resource_and_prevents_replay(oauth_client):
+async def test_code_exchange_binds_resource_and_prevents_replay(oauth_client, monkeypatch):
+    diagnostic_logs: list[str] = _capture_oauth_diagnostics(monkeypatch)
     client_id, redirect_uri, verifier, authorize = _start_authorization(oauth_client)
     callback = _complete_consent(oauth_client, authorize.headers["location"])
     query = parse_qs(urlsplit(callback).query)
     code = query["code"][0]
+    unknown_client = oauth_client.post(
+        "/token",
+        data={
+            "grant_type": "authorization_code",
+            "client_id": "diagnostic-unknown-client",
+            "code": "diagnostic-authorization-code",
+            "redirect_uri": redirect_uri,
+            "code_verifier": "diagnostic-pkce-verifier",
+            "resource": RESOURCE,
+        },
+    )
+    assert unknown_client.status_code == 401
+
     base_form = {
         "grant_type": "authorization_code",
         "client_id": client_id,
@@ -718,20 +744,33 @@ async def test_code_exchange_binds_resource_and_prevents_replay(oauth_client):
     assert missing_resource.status_code == 400
     assert missing_resource.json()["error"] == "invalid_target"
 
-    issued = oauth_client.post(
-        "/token", data={**base_form, "resource": RESOURCE}
-    )
-    assert issued.status_code == 200, issued.text
+    issued = oauth_client.post("/token", data={**base_form, "resource": RESOURCE})
+    assert issued.status_code == 200
     assert issued.json()["expires_in"] == ACCESS_TOKEN_TTL_SECONDS
-    access_token = await oauth_client.app.state.oauth_provider.load_access_token(
-        issued.json()["access_token"]
+    access_token = issued.json()["access_token"]
+    access_record = await oauth_client.app.state.oauth_provider.load_access_token(
+        access_token
     )
-    assert access_token.resource == RESOURCE
+    assert access_record.resource == RESOURCE
     replay = oauth_client.post(
         "/token", data={**base_form, "resource": RESOURCE}
     )
     assert replay.status_code == 400
     assert replay.json()["error"] == "invalid_grant"
+
+    captured_logs = "\n".join(diagnostic_logs)
+    assert "category=invalid_client" in captured_logs
+    assert "category=invalid_target" in captured_logs
+    assert "category=invalid_grant" in captured_logs
+    for secret in (
+        code,
+        verifier,
+        access_token,
+        "diagnostic-authorization-code",
+        "diagnostic-pkce-verifier",
+        "oauth-security-state",
+    ):
+        assert secret not in captured_logs
 
 
 def test_refresh_resource_binding_rotation_and_replay(oauth_client):
@@ -812,8 +851,30 @@ def test_valid_oauth_token_can_list_mcp_tools_without_database(oauth_client):
     assert len(names) == 7
 
 
-def test_claude_callback_token_exchange_and_mcp_request_work_end_to_end(oauth_client):
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "protocol_version", ["2025-03-26", "2025-11-25", "2026-07-28"]
+)
+async def test_claude_public_client_flow_reaches_mcp_tools(
+    oauth_client, monkeypatch, protocol_version
+):
+    diagnostic_logs: list[str] = _capture_oauth_diagnostics(monkeypatch)
     redirect_uri = "https://claude.ai/api/mcp/auth_callback"
+    issuer = get_settings().mcp_issuer_url
+    resource_metadata = oauth_client.get("/.well-known/oauth-protected-resource/mcp")
+    assert resource_metadata.status_code == 200
+    assert resource_metadata.json()["resource"] == RESOURCE
+    assert resource_metadata.json()["authorization_servers"] == [issuer]
+    authorization_metadata = oauth_client.get(
+        "/.well-known/oauth-authorization-server"
+    )
+    assert authorization_metadata.status_code == 200
+    assert authorization_metadata.json()["issuer"] == issuer
+    assert "none" in authorization_metadata.json()[
+        "token_endpoint_auth_methods_supported"
+    ]
+    assert "S256" in authorization_metadata.json()["code_challenge_methods_supported"]
+
     client_id, _, verifier, authorize = _start_authorization(
         oauth_client, redirect_uri=redirect_uri
     )
@@ -827,7 +888,14 @@ def test_claude_callback_token_exchange_and_mcp_request_work_end_to_end(oauth_cl
     )
     callback_params = parse_qs(callback_url.query)
     assert callback_params["state"] == ["oauth-security-state"]
-    assert callback_params["iss"] == [get_settings().mcp_issuer_url]
+    assert callback_params["iss"] == [issuer]
+
+    registered_client = await oauth_client.app.state.oauth_provider.get_client(
+        client_id
+    )
+    assert registered_client is not None
+    assert registered_client.token_endpoint_auth_method == "none"
+    assert registered_client.client_secret is None
 
     token_response = oauth_client.post(
         "/token",
@@ -852,29 +920,99 @@ def test_claude_callback_token_exchange_and_mcp_request_work_end_to_end(oauth_cl
         "Accept": "application/json, text/event-stream",
         "Origin": ORIGIN,
     }
-    initialize = oauth_client.post(
+    if protocol_version == "2026-07-28":
+        startup_method = "server/discover"
+        request_metadata = {
+            "io.modelcontextprotocol/protocolVersion": protocol_version,
+            "io.modelcontextprotocol/clientCapabilities": {},
+            "io.modelcontextprotocol/clientInfo": {
+                "name": "claude-oauth-regression",
+                "version": "1",
+            },
+        }
+        headers["MCP-Protocol-Version"] = protocol_version
+        headers["MCP-Method"] = startup_method
+        startup_payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": startup_method,
+            "params": {"_meta": request_metadata},
+        }
+        missing_method_header = oauth_client.post(
+            "/mcp",
+            json=startup_payload,
+            headers={
+                key: value for key, value in headers.items() if key != "MCP-Method"
+            },
+        )
+        assert missing_method_header.status_code == 400
+        startup = oauth_client.post(
+            "/mcp",
+            json=startup_payload,
+            headers=headers,
+        )
+        assert startup.status_code == 200, startup.text
+        assert protocol_version in startup.json()["result"]["supportedVersions"]
+        list_params = {"_meta": request_metadata}
+    else:
+        startup_method = "initialize"
+        startup = oauth_client.post(
+            "/mcp",
+            json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": startup_method,
+                "params": {
+                    "protocolVersion": protocol_version,
+                    "capabilities": {},
+                    "clientInfo": {
+                        "name": "claude-oauth-regression",
+                        "version": "1",
+                    },
+                },
+            },
+            headers=headers,
+        )
+        assert startup.status_code == 200, startup.text
+        assert startup.json()["result"]["protocolVersion"] == protocol_version
+        if protocol_version >= "2025-06-18":
+            headers["MCP-Protocol-Version"] = protocol_version
+        list_params = {}
+
+    if protocol_version == "2026-07-28":
+        headers["MCP-Method"] = "tools/list"
+    tools = oauth_client.post(
         "/mcp",
         json={
             "jsonrpc": "2.0",
-            "id": 1,
-            "method": "initialize",
-            "params": {
-                "protocolVersion": "2025-03-26",
-                "capabilities": {},
-                "clientInfo": {"name": "claude-oauth-regression", "version": "1"},
-            },
+            "id": 2,
+            "method": "tools/list",
+            "params": list_params,
         },
         headers=headers,
     )
-    assert initialize.status_code == 200
-    tools = oauth_client.post(
-        "/mcp",
-        json={"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
-        headers=headers,
-    )
-
     assert tools.status_code == 200
     assert len(tools.json()["result"]["tools"]) == 7
+
+    captured_logs = "\n".join(diagnostic_logs)
+    assert "oauth token exchange outcome=success status=200" in captured_logs
+    assert (
+        f"mcp initialization outcome=success method={startup_method} status=200"
+        in captured_logs
+    )
+    if protocol_version == "2026-07-28":
+        assert (
+            "mcp initialization outcome=routing_header_mismatch "
+            "method=server/discover status=400"
+        ) in captured_logs
+    for secret in (
+        callback_params["code"][0],
+        verifier,
+        token_payload["access_token"],
+        token_payload["refresh_token"],
+        "oauth-security-state",
+    ):
+        assert secret not in captured_logs
 
 
 def test_registration_rate_limit_returns_safe_retry_response(oauth_client):
