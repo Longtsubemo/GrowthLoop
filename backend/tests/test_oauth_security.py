@@ -425,7 +425,12 @@ def test_consent_form_prevents_repeat_submission_and_preserves_action(
     form_match = re.search(r"<form\b[^>]*>", page.text)
     assert form_match
     assert 'data-consent-form' in form_match.group(0)
-    assert f'action="/oauth/consent?request_id={request_id}"' in form_match.group(0)
+    action_match = re.search(r'action="([^"]+)"', form_match.group(0))
+    assert action_match
+    action = action_match.group(1)
+    action_url = urlsplit(action)
+    assert action_url.scheme == action_url.netloc == action_url.path == ""
+    assert parse_qs(action_url.query) == {"request_id": [request_id]}
     assert 'name="action" value="approve"' in page.text
     assert 'name="action" value="deny"' in page.text
 
@@ -441,6 +446,7 @@ def test_consent_form_prevents_repeat_submission_and_preserves_action(
     csp = page.headers["content-security-policy"]
     script_hash = base64.b64encode(hashlib.sha256(script.encode("utf-8")).digest())
     assert f"script-src 'sha256-{script_hash.decode('ascii')}'" in csp
+    assert "form-action 'self'" in csp
     assert "'unsafe-inline'" not in csp
 
 

@@ -1012,7 +1012,9 @@ def _consent_html(
     csrf_token: str | None = None,
 ) -> str:
     client_name = html.escape(consent.client_name)
-    request_id = html.escape(consent.request_id, quote=True)
+    form_action = html.escape(
+        f"?{urlencode({'request_id': consent.request_id})}", quote=True
+    )
     nonce = html.escape(consent.approval_nonce, quote=True)
     message_html = f'<p role="alert">{html.escape(message)}</p>' if message else ""
     if authenticated:
@@ -1037,7 +1039,7 @@ def _consent_html(
         "<title>GrowthLoop authorization</title><body>"
         "<main><h1>GrowthLoop</h1>"
         f"{message_html}<p>{html.escape(intro)}</p>"
-        f'<form method="post" action="/oauth/consent?request_id={request_id}" data-consent-form>'
+        f'<form method="post" action="{form_action}" data-consent-form>'
         f'<input type="hidden" name="approval_nonce" value="{nonce}">'
         f"{actions}</form>"
         f"<script>{_CONSENT_SUBMIT_SCRIPT}</script></main></body></html>"
