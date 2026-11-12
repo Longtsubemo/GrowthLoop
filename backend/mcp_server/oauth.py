@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import hmac
 import html
@@ -62,6 +63,32 @@ _OAUTH_ENDPOINTS = {
     "/.well-known/oauth-protected-resource/mcp",
 }
 _ORIGIN_GUARDED_PATHS = _OAUTH_ENDPOINTS | {"/mcp"}
+_CONSENT_SUBMIT_SCRIPT = """(() => {
+  const form = document.querySelector('form[data-consent-form]');
+  if (!form) return;
+  form.addEventListener('submit', (event) => {
+    if (form.dataset.submitted === 'true') {
+      event.preventDefault();
+      return;
+    }
+    form.dataset.submitted = 'true';
+    const submitter = event.submitter;
+    if (submitter && submitter.name === 'action') {
+      const action = document.createElement('input');
+      action.type = 'hidden';
+      action.name = 'action';
+      action.value = submitter.value;
+      form.appendChild(action);
+      submitter.removeAttribute('name');
+    }
+    form.querySelectorAll('button[type="submit"]').forEach((button) => {
+      button.disabled = true;
+    });
+  });
+})();"""
+_CONSENT_SUBMIT_SCRIPT_HASH = base64.b64encode(
+    hashlib.sha256(_CONSENT_SUBMIT_SCRIPT.encode("utf-8")).digest()
+).decode("ascii")
 
 
 def _is_safe_redirect_uri(uri: str) -> bool:
@@ -1010,9 +1037,10 @@ def _consent_html(
         "<title>GrowthLoop authorization</title><body>"
         "<main><h1>GrowthLoop</h1>"
         f"{message_html}<p>{html.escape(intro)}</p>"
-        f'<form method="post" action="/oauth/consent?request_id={request_id}">'
+        f'<form method="post" action="/oauth/consent?request_id={request_id}" data-consent-form>'
         f'<input type="hidden" name="approval_nonce" value="{nonce}">'
-        f"{actions}</form></main></body></html>"
+        f"{actions}</form>"
+        f"<script>{_CONSENT_SUBMIT_SCRIPT}</script></main></body></html>"
     )
 
 
@@ -1023,7 +1051,8 @@ def _consent_response(body: str, *, status_code: int = 200) -> HTMLResponse:
         headers={
             "Cache-Control": "no-store",
             "Content-Security-Policy": (
-                "default-src 'none'; form-action 'self'; base-uri 'none'; "
+                f"default-src 'none'; script-src 'sha256-{_CONSENT_SUBMIT_SCRIPT_HASH}'; "
+                "form-action 'self'; base-uri 'none'; "
                 "frame-ancestors 'none'"
             ),
             "Referrer-Policy": "no-referrer",

@@ -409,6 +409,41 @@ def test_consent_nonce_cannot_be_replayed_after_completion(
     assert replay.status_code == 400
 
 
+def test_consent_form_prevents_repeat_submission_and_preserves_action(
+    production_oauth_client,
+):
+    _, _, _, authorize = _start_authorization(production_oauth_client)
+    request_id = _consent_request_id(authorize.headers["location"])
+    page = _consent_page(production_oauth_client, request_id)
+    nonce = _hidden_value(page.text, "approval_nonce")
+    login = _login_for_consent(
+        production_oauth_client, request_id, nonce, origin=ISSUER_ORIGIN
+    )
+    assert login.status_code == 303
+
+    page = _consent_page(production_oauth_client, request_id)
+    form_match = re.search(r"<form\b[^>]*>", page.text)
+    assert form_match
+    assert 'data-consent-form' in form_match.group(0)
+    assert f'action="/oauth/consent?request_id={request_id}"' in form_match.group(0)
+    assert 'name="action" value="approve"' in page.text
+    assert 'name="action" value="deny"' in page.text
+
+    script_match = re.search(r"<script>(.*?)</script>", page.text, re.DOTALL)
+    assert script_match
+    script = script_match.group(1)
+    assert "form.dataset.submitted === 'true'" in script
+    assert "event.preventDefault()" in script
+    assert "action.value = submitter.value" in script
+    assert "submitter.removeAttribute('name')" in script
+    assert "button.disabled = true" in script
+
+    csp = page.headers["content-security-policy"]
+    script_hash = base64.b64encode(hashlib.sha256(script.encode("utf-8")).digest())
+    assert f"script-src 'sha256-{script_hash.decode('ascii')}'" in csp
+    assert "'unsafe-inline'" not in csp
+
+
 def test_concurrent_consent_submissions_consume_request_once(
     production_oauth_client,
 ):
